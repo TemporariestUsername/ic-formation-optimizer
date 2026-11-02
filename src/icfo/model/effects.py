@@ -42,6 +42,10 @@ class Effect:
     feat_id: int | None = None
     index: int = 0  # position among the upgrade's/feat's effect keys
     resolved_amount: float | None = None  # from amount_expr, when present
+    # (upgrade id, effect index) parameters a pure-product amount formula reads;
+    # buffs aimed at those parameters scale this effect (pre-stack)
+    amount_refs: tuple[tuple[int, int], ...] = ()
+    amount_cap: float | None = None  # effect_cap along the formula chain
 
     # -- arguments ---------------------------------------------------------
     def num(self, i: int, default: float = 0.0) -> float:

@@ -263,6 +263,36 @@ class GameData:
             raise UnsupportedExpr(f"amount formula {expr!r} is not numeric")
         return float(value)
 
+    def _amount_refs(self, expr: str, depth: int = 0) -> tuple[tuple[tuple[int, int], ...], float | None]:
+        """Parameters a pure-product formula reads (recursively), and the tightest cap.
+
+        Only products of ``upgrade_amount(U,i)`` and constants qualify: a buff
+        to a referenced parameter then scales the result proportionally.
+        """
+        s = str(expr)
+        if "+" in s or "-" in s or "/" in s or depth > 4:
+            return (), None
+        refs: list[tuple[int, int]] = []
+        cap: float | None = None
+        for m in re.finditer(r"upgrade_amount\(\s*(\d+)\s*,\s*(\d+)\s*\)", s):
+            uid, idx = int(m.group(1)), int(m.group(2))
+            refs.append((uid, idx))
+            up = self.upgrades.get(uid)
+            if up is not None and idx < len(up.effects):
+                ref = up.effects[idx]
+                c = ref.raw.get("effect_cap")
+                if isinstance(c, (int, float)):
+                    cap = c if cap is None else min(cap, c)
+                if "amount_expr" in ref.raw:
+                    sub_refs, sub_cap = self._amount_refs(ref.raw["amount_expr"], depth + 1)
+                    refs += sub_refs
+                    if sub_cap is not None:
+                        cap = sub_cap if cap is None else min(cap, sub_cap)
+        stripped = re.sub(r"upgrade_amount\([^)]*\)", "", s)
+        if re.search(r"[A-Za-z_]", stripped):
+            return (), cap  # other functions involved: not a pure product
+        return tuple(dict.fromkeys(refs)), cap
+
     def _resolve_amounts(self) -> None:
         """Fill ``resolved_amount`` for effects whose amount lives in a formula."""
         def resolve(effects: list[Effect]) -> list[Effect]:
@@ -273,6 +303,11 @@ class GameData:
                         e = replace(e, resolved_amount=self._eval_amount(e.raw["amount_expr"]))
                     except (UnsupportedExpr, ValueError, TypeError):
                         pass  # stays None -> reported as unmodelled
+                    refs, cap = self._amount_refs(e.raw["amount_expr"])
+                    own_cap = e.raw.get("effect_cap")
+                    if isinstance(own_cap, (int, float)):
+                        cap = own_cap if cap is None else min(cap, own_cap)
+                    e = replace(e, amount_refs=refs, amount_cap=cap)
                 out.append(e)
             return out
 

@@ -77,12 +77,21 @@ def _solve(job: _Job) -> list[dict]:
     objectives = {m: make_objective(m, data, user, _STATE["calibration"], _STATE["gem_params"]) for m in job.modes}
     oscorers = {m: ObjectiveScorer(scorer, o) for m, o in objectives.items()}
 
+    account_specs = {h: dict(v) for h, v in scorer.specs.items()}
+
+    def use_specs(specs):
+        scorer.specs = {h: dict(v) for h, v in account_specs.items()}
+        for h, v in specs.items():
+            scorer.specs[h] = dict(v)
+        scorer.invalidate()
+
     found = {}
     errors = {}
     for m in job.modes:
+        use_specs({})
         try:
             p = plan(oscorers[m], constraints, pool, None, _STATE["profile"])
-            found[m] = (p.carry, p.placement)
+            found[m] = (p.carry, p.placement, p.specs, p.spec_changes)
         except Infeasible as exc:
             errors[m] = str(exc)
 
@@ -93,17 +102,19 @@ def _solve(job: _Job) -> list[dict]:
             rows.append({**row, "error": errors.get(m, "no feasible formation")})
             continue
         best = None
-        for src_mode, (carry, placement) in found.items():
+        for src_mode, (carry, placement, specs, changes) in found.items():
+            use_specs(specs)
             res = oscorers[m].score(placement, carry.id)
             if best is None or res.log10 > best[0].log10:
-                best = (res, carry, placement, src_mode)
-        res, carry, placement, src_mode = best
+                best = (res, carry, placement, src_mode, changes)
+        res, carry, placement, src_mode, changes = best
         rows.append({
             **row,
             "carry": carry.name,
             "formation": "; ".join(f"{s}:{c.name}" for s, c in sorted(placement.items())),
             "value": round(res.log10, 3),
             "found_by": src_mode,
+            "spec_changes": "; ".join(f"{c}: {a} -> {b}" for c, a, b in changes),
             "coverage": round(res.coverage, 3),
             "approx_share": round(res.approx_share, 3),
             "warnings": " | ".join(constraints.warnings),

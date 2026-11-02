@@ -75,6 +75,7 @@ class SpeedEffect:
     args: tuple[str, ...]
     amount: float | None  # amplified amount (None when the key carries no amount)
     stacks: float
+    raw: dict = field(default_factory=dict, compare=False, hash=False, repr=False)
 
 
 @dataclass
@@ -319,7 +320,7 @@ class Scorer:
                         comp.bad_amps.append(e)
                 else:
                     comp.dynamic_amps.append(e)
-            elif key in PARAM_KEYS or key in NON_DAMAGE_KEYS:
+            elif key in PARAM_KEYS or key in NON_DAMAGE_KEYS or key.startswith("pre_stack"):
                 continue
             elif key == "hero_dps_multiplier_mult" and _self_only(e):
                 comp.self_only.append(e)
@@ -481,8 +482,22 @@ class Scorer:
         if e.upgrade_id is None:
             return base
         k_all, k_idx = (e.upgrade_id, None), (e.upgrade_id, e.index)
-        f = min(factor.get(k_all, 1.0) * factor.get(k_idx, 1.0), _FACTOR_CAP)
-        return (base + flat.get(k_all, 0.0) + flat.get(k_idx, 0.0)) * f
+        f = min(factor.get(k_all, 1.0) * factor.get(k_idx, 1.0) * self._ref_factor(e, factor), _FACTOR_CAP)
+        amount = (base + flat.get(k_all, 0.0) + flat.get(k_idx, 0.0)) * f
+        return min(amount, e.amount_cap) if e.amount_cap is not None else amount
+
+    @staticmethod
+    def _ref_factor(e: Effect, factor) -> float:
+        """Buffs aimed at parameters this effect's formula reads (e.g. pre_stack_gems)."""
+        f = 1.0
+        seen_upgrades = {e.upgrade_id}
+        for uid, idx in e.amount_refs:
+            if (uid, idx) != (e.upgrade_id, e.index):
+                f *= factor.get((uid, idx), 1.0)
+            if uid not in seen_upgrades:
+                f *= factor.get((uid, None), 1.0)
+                seen_upgrades.add(uid)
+        return f
 
     def _amplifier_terms(self, e: Effect, src: Champion, src_slot: int, ctx: _Ctx):
         """(target keys, combine mode, stack count, exact?) for one amplifier."""
@@ -569,7 +584,9 @@ class Scorer:
         if base is None:
             raise _Unmodelled
         k_all, k_idx = (e.upgrade_id, None), (e.upgrade_id, e.index)
-        base += flat.get(k_all, 0.0) + flat.get(k_idx, 0.0)
+        base = (base + flat.get(k_all, 0.0) + flat.get(k_idx, 0.0)) * self._ref_factor(e, factor)
+        if e.amount_cap is not None:
+            base = min(base, e.amount_cap)
         f = factor.get(k_all, 1.0) * factor.get(k_idx, 1.0)
         stacked = self._combine(e, mode, n, base)  # log10(1 + bonus)
         if f == 1.0 or stacked == 0.0:
@@ -613,7 +630,7 @@ class Scorer:
             n, _ = self._stacks(e, src, src_slot, ctx)
         except (_Unmodelled, UnsupportedExpr):
             n = 1.0
-        return SpeedEffect(src.name, src.id, e.key, e.args, amount, n)
+        return SpeedEffect(src.name, src.id, e.key, e.args, amount, n, e.raw)
 
     @staticmethod
     def _mode(e: Effect) -> str:
@@ -756,7 +773,7 @@ def static_class(e: Effect, layout: Layout) -> str:
     from .catalog import COUNTED_STACK_FUNCS, SUPPORTED_AMOUNT_FUNCS
 
     key = e.key
-    if key in PARAM_KEYS:
+    if key in PARAM_KEYS or key.startswith("pre_stack"):
         return "param"
     if key in GOLD_KEYS:
         return "gold"

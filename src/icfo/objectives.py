@@ -15,9 +15,11 @@ gold find, speed effects) plus constants from the game's own rules:
 **Favor**  favor per run ∝ (gold find × gold at the area you stall at)^0.315,
            and the stall area is where damage meets monster health, so
            log10(favor) = 0.315 · (log10 damage + log10 gold find) + const.
-**Gems**   maximise areas per hour up to a reset area (Briv jumps, Thellora's
-           start skip, spawn/quest/time-scale effects), with a damage floor:
-           the formation must still be able to reach the reset area.
+**Gems**   maximise boss areas per hour × gems per boss, up to a reset area:
+           Briv jumps, Thellora's start skip, spawn/quest/time-scale effects;
+           +% boss gems (Ellywick's gem cards from her deck: hand size × gem
+           odds or the "Gem" feat, each card's amount buffed by her gear/feats);
+           and a damage floor: the formation must reach the reset area.
 
 Absolute area estimates need one calibration point: an instance on the
 account with a known formation and highest area. The model's damage for that
@@ -37,6 +39,8 @@ from .model.user import UserState
 
 BRIV_ID = 58
 THELLORA_ID = 139
+ELLYWICK_ID = 83
+ELLYWICK_GEM_FEAT = 1880  # "Gem": gem cards prioritized
 
 
 # -- progression ---------------------------------------------------------------
@@ -204,6 +208,8 @@ class GemParams:
     thellora_areas: float | None = None  # None: account stat
     time_scale_cap: float = 10.0
     transition_scale_cap: float = 5.0  # game rule area_transition_time_scale_cap
+    skipped_bosses_pay: bool = True  # count boss areas Briv/Thellora skip (community "BPH")
+    ellywick_hand: int = 5  # cards Ellywick holds
 
 
 def briv_jump(item_multiplier: float) -> tuple[int, float]:
@@ -295,12 +301,35 @@ class GemObjective:
             completed = jumps + max(0.0, remaining - jumps * adv)
         run_s = completed * t_area + p.reset_overhead_s
         areas_per_hour = (p.reset_area - 1) / run_s * 3600 if run_s > 0 else 0.0
+        bosses = (p.reset_area - 1) / 5 if p.skipped_bosses_pay else completed / 5
+        boss_per_hour = bosses / run_s * 3600 if run_s > 0 else 0.0
+
+        # gems per boss: +% sources add; Ellywick's gem cards come from her deck
+        bonus, gem_cards, per_card = 0.0, 0.0, 0.0
+        deck = next((s for s in res.speed if s.key == "ellywick_deck_of_many_things"), None)
+        for s in res.speed:
+            if s.key != "increase_boss_gems_percent" or s.amount is None:
+                continue
+            if s.hero_id == ELLYWICK_ID and deck is not None:
+                per_card = s.amount
+                draws = completed * kills / max(1.0, float(deck.raw.get("monster_kills_for_card_draw", 25)))
+                draws = min(draws, run_s / max(1.0, float(deck.raw.get("card_draw_cooldown", 60))))
+                prioritized = ELLYWICK_GEM_FEAT in self.user.feats.get(ELLYWICK_ID, ())
+                share = 1.0 if prioritized else float(deck.raw.get("gem_odds", 20)) / 100
+                gem_cards = min(p.ellywick_hand, draws) * share
+                bonus += gem_cards * per_card
+            elif not s.raw.get("manual_stacking"):
+                bonus += s.amount * (s.stacks or 1.0)
+        gem_mult = 1 + bonus / 100
 
         push = PushObjective(self.data, self.calibration)
         reach = push.est_area(res, carry)
         return {
+            "rel_gems_per_hour": round(boss_per_hour * gem_mult, 1),
+            "gem_multiplier": round(gem_mult, 3),
+            "ellywick_gem_cards": round(gem_cards, 2) if deck is not None else "-",
             "areas_per_hour": round(areas_per_hour, 1),
-            "boss_areas_per_hour": round(areas_per_hour / 5, 1),
+            "boss_areas_per_hour": round(boss_per_hour, 1),
             "run_minutes": round(run_s / 60, 2),
             "start_area": round(start, 1),
             "briv_jump": f"{jump} ({chance:.0%})" if jump > 1 else "-",
@@ -312,7 +341,7 @@ class GemObjective:
 
     def value(self, res, carry, placement):
         m = self.model(res, carry, placement)
-        v = math.log10(max(m["areas_per_hour"], 1e-6))
+        v = math.log10(max(m["rel_gems_per_hour"], 1e-6))
         reach = m["est_reach_area"]
         if reach is not None and reach < self.params.reset_area:
             v -= 0.05 * (self.params.reset_area - reach)  # can't reach the reset area: steep penalty

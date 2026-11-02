@@ -152,6 +152,7 @@ def _gem_params(args, user: UserState, adventure_id: int | None = None) -> GemPa
         spawn_interval_s=args.spawn_interval,
         transition_s=args.transition_time,
         briv_stacks=args.briv_stacks,
+        skipped_bosses_pay=not args.skipped_bosses_dont_pay,
     )
 
 
@@ -193,6 +194,7 @@ def cmd_optimize(args) -> None:
         if args.solver == "planner":
             p = plan(oscorer, constraints, pool, carry, args.profile, seed=args.seed)
             carry, placement, sc, evals, tried = p.carry, p.placement, p.result, p.evaluations, p.carries_tried
+            spec_changes = p.spec_changes
         else:
             if carry is None:
                 sys.exit("--solver greedy/anneal/cpsat need --carry; use the default planner for auto carry")
@@ -204,6 +206,7 @@ def cmd_optimize(args) -> None:
             else:
                 r = anneal(oscorer, constraints, pool, carry, iterations=args.iterations, seed=args.seed)
             placement, sc, evals, tried = r.placement, r.score, r.evaluations, [carry.name]
+            spec_changes = []
     except Infeasible as exc:
         sys.exit(f"infeasible: {exc}")
 
@@ -214,6 +217,10 @@ def cmd_optimize(args) -> None:
           + (f"  (auto, compared: {', '.join(tried)})" if len(tried) > 1 else ""))
     print(f"account: {'yours (specs, feats, gear applied)' if user.from_account else 'theory (owns everything, default specs)'}\n")
     print(constraints.layout.render(labels, width=12))
+    if spec_changes:
+        print("\nspecialization changes for this formation:")
+        for name, before, after in spec_changes:
+            print(f"  {name:<18} {before} -> {after}")
     print()
     for k, v in objective.summary(sc, carry, placement).items():
         print(f"  {k:<18} {v}")
@@ -345,6 +352,8 @@ def main(argv: list[str] | None = None) -> None:
         sp.add_argument("--spawn-interval", type=float, default=1.0, help="gems: seconds between spawns at base speed")
         sp.add_argument("--transition-time", type=float, default=4.0, help="gems: seconds per area transition")
         sp.add_argument("--briv-stacks", type=float, help="gems: Sprint stacks per run (default: your current stacks)")
+        sp.add_argument("--skipped-bosses-dont-pay", action="store_true",
+                        help="gems: only completed boss areas give gems (default counts skipped ones too)")
 
     s = sub.add_parser("optimize", help="best formation for one adventure")
     s.add_argument("adventure", type=int)

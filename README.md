@@ -7,7 +7,7 @@ them at once, for three goals:
 |---|---|---|
 | `push` | the highest reachable area | damage of the best carry (base attack × formation multiplier) |
 | `favor` | favor per run | `0.315 × (log10 damage + log10 gold find)`, derived from the game's growth constants |
-| `gems` | areas (boss areas) per hour to a reset area | Briv jumps, Thellora's start skip, spawn/quest/time-scale effects, plus a damage floor |
+| `gems` | boss areas per hour × gems per boss, to a reset area | Briv jumps, Thellora's start skip, spawn/quest/time-scale effects, Ellywick's gem cards, plus a damage floor |
 
 It uses your real account data (owned champions, specializations, feats, gear) and
 the game's own definitions. It picks the carry automatically.
@@ -41,7 +41,12 @@ That instance may not be at its wall, so the estimates are lower bounds.
 **Gems model.** seconds per area = kills × spawn interval ÷ (spawn speed × kill credit)
 ÷ game speed + transition. Briv: jump size and chance from his slot-4 item
 (`0.25 + 0.25·m`, halved until ≤1, the method ic.byteglow.com uses), and jumps per run
-from Sprint stacks (−4% per jump while ≥50). Thellora: start skip from your stats. The
+from Sprint stacks (−4% per jump while ≥50). Thellora: start skip from your stats.
+Gems per boss: +% boss-gem effects add. Ellywick holds 5 cards; expected gem cards =
+5 × gem odds (20% base, 40% with All That Sparkles, all 5 with the "Gem" feat), each worth
+her gem amount buffed by her gear and feats (capped at +100% per card). Base gems per
+boss aren't in the game data, so gem output is relative. `--skipped-bosses-dont-pay`
+counts only boss areas actually completed. The
 formation must reach the reset area, using the calibrated damage. Base timings are
 flags (`--kills-per-area`, `--spawn-interval`, `--transition-time`, `--briv-stacks`);
 only relative values matter for ranking.
@@ -192,9 +197,9 @@ contains personal data (email, linked accounts). Only the fields listed in
    (`expression_on_trigger`, `broadcast_on_trigger`, `*_stacks` keys, Aerois Synergy,
    Mithral Hall), starting with the supports that show up most in optimized formations.
    Also: effects conditional on specific feats, and `affected_by_upgrade` filters.
-2. **Account fidelity.** Specs, feats and gear are applied. Still missing:
-   legendaries, familiars, blessings and patron perks, plus letting the optimizer choose
-   specs and feats itself.
+2. **Account fidelity.** Specs, feats and gear are applied, and the planner picks the
+   best specialization per formation and objective. Still missing: feat selection,
+   legendaries, familiars, blessings and patron perks.
 3. **Better carry comparison.** Add levels and ultimates to the base-attack model.
 4. **Pairwise CP-SAT terms.** Add product variables for interactions the surrogate
    misses, such as an amplifier boosting a positional buff.

@@ -142,4 +142,8 @@ SPEED_KEYS = frozenset({
     "area_transition_time_scale",
     "briv_unnatural_haste",
     "briv_unnatural_haste_stack_consume_percent_override",
+    # gems per boss (gem objective)
+    "increase_boss_gems_percent",
+    "increase_boss_gems",
+    "ellywick_deck_of_many_things",
 })

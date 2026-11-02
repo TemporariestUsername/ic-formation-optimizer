@@ -37,6 +37,50 @@ class Plan:
     result: object  # ScoreResult
     evaluations: int
     carries_tried: list[str] = field(default_factory=list)
+    specs: dict[int, dict[int, int]] = field(default_factory=dict)  # hero -> {group: upgrade id}
+    spec_changes: list[tuple[str, str, str]] = field(default_factory=list)  # (champion, from, to)
+
+
+def optimize_specs(scorer, placement: dict[int, Champion], carry: Champion, rounds: int = 2):
+    """Coordinate ascent over specialization choices of the placed champions.
+
+    Specializations are saved per formation in game, so the best choice for
+    this formation and objective is a legitimate recommendation. Leaves the
+    scorer set to the chosen specs; returns (result, specs, changes).
+    """
+    base = scorer.scorer if hasattr(scorer, "scorer") else scorer
+    data = base.data
+    start = {h: dict(base.specs.get(h, {})) for h in (c.id for c in placement.values())}
+    best = scorer.score(placement, carry.id)
+    for _ in range(rounds):
+        improved = False
+        for champ in placement.values():
+            for gi, group in enumerate(champ.spec_groups):
+                if len(group) < 2:
+                    continue
+                current = base.specs.get(champ.id, {}).get(gi, group[0].id)
+                for option in group:
+                    if option.id == current:
+                        continue
+                    base.specs.setdefault(champ.id, {})[gi] = option.id
+                    base.invalidate(champ.id)
+                    res = scorer.score(placement, carry.id)
+                    if res.log10 > best.log10 + 1e-9:
+                        best, current, improved = res, option.id, True
+                base.specs.setdefault(champ.id, {})[gi] = current
+                base.invalidate(champ.id)
+        if not improved:
+            break
+    changes = []
+    for champ in placement.values():
+        for gi, group in enumerate(champ.spec_groups):
+            before = start.get(champ.id, {}).get(gi, group[0].id)
+            after = base.specs.get(champ.id, {}).get(gi, group[0].id)
+            if before != after:
+                name = lambda uid: data.upgrades[uid].specialization_name or data.upgrades[uid].name
+                changes.append((champ.name, name(before), name(after)))
+    chosen = {c.id: dict(base.specs.get(c.id, {})) for c in placement.values() if c.spec_groups}
+    return scorer.score(placement, carry.id), chosen, changes
 
 
 def _anchor_slot(constraints: Constraints, carry: Champion) -> int | None:
@@ -178,4 +222,5 @@ def plan(scorer, constraints: Constraints, pool: list[Champion], carry: Champion
                     cand = pol
             if cand.score.log10 > best_res.score.log10:
                 best_res, best_carry = cand, c
-    return Plan(best_carry, best_res.placement, best_res.score, evals, [c.name for c in shortlist])
+    final, specs, changes = optimize_specs(scorer, best_res.placement, best_carry)
+    return Plan(best_carry, best_res.placement, final, evals, [c.name for c in shortlist], specs, changes)

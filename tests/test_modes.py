@@ -142,3 +142,33 @@ def test_sweep_groups_and_writes_csv(tmp_path):
     assert {(r["adventure_id"], r["mode"]) for r in rows} == {("1", "push"), ("1", "favor"), ("2", "push"), ("2", "favor")}
     assert all(r["carry"] == "Carry" for r in rows)
     assert all("3:" not in r["formation"] for r in rows if r["adventure_id"] == "2")  # slot 3 is blocked there
+
+
+def test_gem_multiplier_from_ellywick_cards():
+    from icfo.engine.score import ScoreResult, SpeedEffect
+    data = GameData(DEFS)
+    u = UserState.from_details(USER)
+    params = GemParams(reset_area=101, kills_per_area=25, spawn_interval_s=1, transition_s=0, reset_overhead_s=0)
+    res = ScoreResult(log10=0.0)
+    deck = {"monster_kills_for_card_draw": 25, "card_draw_cooldown": 60, "gem_odds": 40}
+    res.speed = [
+        SpeedEffect("Ellywick", 83, "ellywick_deck_of_many_things", (), 0.0, 1.0, deck),
+        SpeedEffect("Ellywick", 83, "increase_boss_gems_percent", ("0",), 15.0, 1.0, {"manual_stacking": True}),
+    ]
+    obj = GemObjective(data, u, params)
+    m = obj.model(res, data.champions[1], {0: data.champions[1]})
+    assert m["ellywick_gem_cards"] == pytest.approx(2.0)  # 5-card hand x 40% gem odds
+    assert m["gem_multiplier"] == pytest.approx(1.30)
+    assert m["rel_gems_per_hour"] == pytest.approx(m["boss_areas_per_hour"] * 1.30, abs=0.1)
+    u.feats[83] = (1880,)  # "Gem" feat: hand fills with gem cards
+    assert obj.model(res, data.champions[1], {0: data.champions[1]})["gem_multiplier"] == pytest.approx(1.75)
+
+
+def test_formula_parameters_receive_their_buffs():
+    """A buff aimed at a pre_stack parameter (effect #0) scales the effect reading it."""
+    from test_effect_semantics import HEROES, build, score
+    keys = [{"effect_string": "pre_stack_amount,50"},
+            {"effect_string": "global_dps_multiplier_mult,0", "amount_expr": "upgrade_amount(10,0)"}]
+    data = build(HEROES, [(10, 2, "effect_def,1"), (20, 3, "buff_upgrade,100,10,0")], [(1, keys)])
+    assert score(data, {0: 1, 1: 2}).log10 == pytest.approx(L(1.5))
+    assert score(data, {0: 1, 1: 2, 2: 3}).log10 == pytest.approx(L(2.0))  # 50% -> 100%
