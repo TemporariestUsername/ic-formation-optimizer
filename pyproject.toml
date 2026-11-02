@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "icfo"
+version = "0.1.0"
+description = "Formation optimizer for Idle Champions of the Forgotten Realms"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+solver = ["ortools>=9.10"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+icfo = "icfo.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.venv/
+build/
+dist/
+
+# Local game-data cache and credentials: never commit these.
+.icfo-cache/
+credentials.json
+.env
