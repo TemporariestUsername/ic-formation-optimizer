@@ -123,6 +123,7 @@ COUNTED_STACK_FUNCS = frozenset({
     "per_unique_race",
     "per_upgrade_targets",
     "check_patron",
+    "egbert_atonement",
 })
 
 # how a stack count combines with the amount

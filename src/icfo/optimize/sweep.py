@@ -73,6 +73,8 @@ def _solve(job: _Job) -> list[dict]:
     scorer = Scorer(data, constraints.layout)
     if _STATE["use_account"]:
         scorer.apply_account(user)
+    if _STATE.get("run_area"):
+        scorer.run_area = float(_STATE["run_area"])
     if _STATE.get("bonuses") is not None:
         scorer.set_bonuses(_STATE["bonuses"].effects_for(job.adventure_id, patron), patron)
     scorer.stack_fraction = _STATE.get("stack_fraction", 1.0)
@@ -171,6 +173,7 @@ def run_sweep(
     tiers: Iterable[str] = TIERS,
     bonuses=None,
     patron: int | None = None,
+    run_area: float | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> dict:
     champs = list(data.champions.values())
@@ -193,7 +196,7 @@ def run_sweep(
     _STATE.update(data=data, user=user, calibration=calibration, profile=profile,
                   use_account=use_account, gem_params=gem_params,
                   stack_fraction=stack_fraction, stack_overrides=stack_overrides, tiers=tuple(tiers),
-                  bonuses=bonuses, patron=patron)
+                  bonuses=bonuses, patron=patron, run_area=run_area)
     started = time.time()
     results: list[dict] = []
     if workers > 1:

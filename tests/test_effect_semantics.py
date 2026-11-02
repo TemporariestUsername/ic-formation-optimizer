@@ -2,6 +2,8 @@
 
 import math
 
+import pytest
+
 from icfo.engine import Scorer
 from icfo.engine.score import static_class
 from icfo.model import GameData
@@ -147,3 +149,32 @@ def test_per_unique_species_and_amplifier_of_amplifier():
     # species: human (Carry, Helper), elf, dwarf -> 3 unique; 20% x 3 = 60%, x2.5 post-stack
     res = score(data, {0: 1, 1: 2, 2: 3, 3: 4})
     assert math.isclose(res.log10, L(1 + 0.6 * 2.5))
+
+
+def test_per_hero_targets_limits_the_count_to_neighbours():
+    """Dob-style "for each Champion next to him": only adjacent champions count."""
+    eff = ('{"effect_string":"global_dps_multiplier_mult,100","amount_func":"mult","stack_func":"per_hero_attribute",'
+           '"per_hero_expr":"true","per_hero_targets":["adj"]}')
+    data = build(HEROES, [(10, 2, eff)])
+    # Weak in slot 3 (adjacent to 1 and 2); Carry in slot 0 is not adjacent
+    assert score(data, {0: 1, 3: 2}).log10 == pytest.approx(0.0)
+    assert score(data, {0: 1, 3: 2, 1: 3}).log10 == pytest.approx(L(2))  # Middling is next to Weak
+    assert score(data, {0: 1, 3: 2, 1: 3, 2: 4}).log10 == pytest.approx(2 * L(2))
+
+
+def test_egbert_atonement_and_banked_stacks():
+    egbert = ('{"effect_string":"global_dps_multiplier_mult,10","amount_func":"add","stack_func":"egbert_atonement"}')
+    heroes = [(1, "Carry", ["dps", "lawful"], "Human", {}), (2, "Egbert", ["support"], "Human", {}),
+              (3, "Law", ["lawful"], "Human", {}), (4, "Chaos", ["chaotic"], "Human", {})]
+    data = build(heroes, [(10, 2, egbert)])
+    assert score(data, {0: 1, 1: 2, 2: 3}).log10 == pytest.approx(L(1 + 4 * 0.10))  # (2 lawful)^2 = 4
+    assert score(data, {0: 1, 1: 2, 2: 3, 3: 4}).log10 == pytest.approx(L(1.1))  # (2-1)^2 = 1
+    # Rust-style cap: stacks = ceil(run_area / 5) for a manually stacked buff
+    rust = [{"effect_string": "buff_upgrade,5,10", "stacks_multiply": True, "manual_stacking": True},
+            {"effect_string": "stacks_max_stack_expr,0,highest_available_area/5", "rounding_mode": "ceil"}]
+    data = build(HEROES, [(10, 2, '{"effect_string":"global_dps_multiplier_mult,100"}'), (20, 2, "effect_def,1")], [(1, rust)])
+    from icfo.engine import Scorer
+    s = Scorer(data, data.layout_for(1))
+    s.run_area = 48  # -> 10 stacks
+    res = s.score({0: data.champions[1], 1: data.champions[2]}, 1)
+    assert res.log10 == pytest.approx(L(1 + 1.05 ** 10))

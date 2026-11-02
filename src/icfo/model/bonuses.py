@@ -92,6 +92,20 @@ class Bonuses:
         self.campaign_currency = {
             _int(c.get("id")): _int(c.get("reset_currency_id")) for c in data.raw.get("campaign_defines") or []
         }
+        # Divine favor itself: "gold_multiplier_add,$(reset_currency_count)" = +count% gold find
+        self.favor_gold: dict[int, Bonus] = {}
+        for rc in defines.get("reset_currency_defines") or []:
+            cid = _int(rc.get("id"))
+            count = user.favor.get(cid, 0.0)
+            if count <= 0:
+                continue
+            for eff in rc.get("effects") or []:
+                s = str(eff.get("effect_string", "")) if isinstance(eff, dict) else ""
+                if s.startswith("gold_multiplier_add,"):
+                    name = f"{rc.get('name', 'Favor')} ({count:.2e})"
+                    e = Effect(key="gold_multiplier_mult", args=(f"{count:.10g}",),
+                               raw={"effect_string": f"gold_multiplier_mult,{count:.10g}", "targets": ["all"], "_bonus": name})
+                    self.favor_gold[cid] = Bonus(name, "favor", 1, (e,), currency_id=cid)
 
     @property
     def available(self) -> bool:
@@ -102,6 +116,8 @@ class Bonuses:
         if adventure_id is not None and adventure_id in self.data.adventures:
             currency = self.campaign_currency.get(self.data.adventures[adventure_id].campaign_id)
         out = [b for b in self.blessings if b.kind == "global blessing" or b.currency_id == currency]
+        if currency in self.favor_gold:
+            out.append(self.favor_gold[currency])
         out += [p for p in self.perks if p.kind == "global perk" or (patron_id and p.patron_id == patron_id)]
         return out
 

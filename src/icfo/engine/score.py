@@ -136,9 +136,14 @@ def _self_only(e: Effect) -> bool:
     return t is None or t == ["self"] or t == "self"
 
 
+# manual stack mechanics whose current count the game saves as an account stat
+_ACCOUNT_STACK_STATS = {
+    "dob_offshore_accounting": "dob_deposit",
+}
+
 _FORMATION_STACK_FUNCS = frozenset({
     "per_hero_attribute", "per_crusader", "per_hero", "per_tagged_crusader_mult",
-    "adjacent_champions", "per_unique_race", "per_upgrade_targets",
+    "adjacent_champions", "per_unique_race", "per_upgrade_targets", "egbert_atonement",
 })
 
 
@@ -198,6 +203,10 @@ class Scorer:
         self.gear: dict[int, list[GearItem]] = {}
         # share of max_stacks assumed for runtime-stacked effects (1.0 = fully stacked)
         self.stack_fraction: float = 1.0
+        # area a run reaches, for stack caps like "highest area / 5" (Rust's Riches)
+        self.run_area: float = 1000.0
+        # stacks the account has banked for manual mechanics (e.g. Dob's Deposit stacks)
+        self.account_stacks: dict[str, float] = {}
         # account-wide bonuses (blessings, patron perks) for the current adventure
         self.patron_id: int | None = None
         self._bonus_compiled: _Compiled | None = None
@@ -232,7 +241,11 @@ class Scorer:
         return out
 
     def apply_account(self, user: UserState) -> None:
-        """Use the account's specializations, feats and gear."""
+        """Use the account's specializations, feats, gear, banked stacks and run depth."""
+        self.account_stacks = {k: user.stat(k) for k in _ACCOUNT_STACK_STATS.values() if k in user.stats}
+        deepest = max((i.highest_area for i in user.instances), default=0)
+        if deepest > 0:
+            self.run_area = float(deepest)
         self.feats = {h: f for h, f in user.feats.items() if f}
         self.gear = {h: g for h, g in user.gear.items()}
         self.specs = {}
@@ -742,6 +755,9 @@ class Scorer:
             return self.stack_overrides[e.upgrade_id], False  # user assumption
         if sf is None or sf in ("mult", "add"):
             if e.triggered:
+                banked = self._banked_stacks(e)
+                if banked is not None:
+                    return banked, False
                 if e.manually_stacked or e.max_stacks is None or e.max_stacks > MAX_ASSUMED_STACKS:
                     raise _Unmodelled
                 return e.max_stacks * self.stack_fraction, False  # assumed share of max stacks
@@ -753,13 +769,28 @@ class Scorer:
             expr = e.raw.get("per_hero_expr")
             if not isinstance(expr, str):
                 raise _Unmodelled
+            pool = ctx.present
+            scope = e.raw.get("per_hero_targets")
+            if scope:  # count only champions in these slots relative to the source
+                slots: set[int] = set()
+                for rel in (scope if isinstance(scope, list) else [scope]):
+                    t = self.layout.targets(rel, src_slot)
+                    if t is None:
+                        raise _Unmodelled
+                    slots |= t
+                pool = [ctx.placement[sl] for sl in slots if sl in ctx.placement]
             total = 0.0
-            for c in ctx.present:
+            for c in pool:
                 if e.exclude_self and c.id == src.id:
                     continue
                 v = evaluate(expr, c, e.raw)
                 total += float(v) if not isinstance(v, bool) else (1.0 if v else 0.0)
             return total, exact
+        if sf == "egbert_atonement":
+            # Lawful minus Chaotic champions (excluding Egbert), squared
+            pts = sum(1 for c in ctx.present if c.id != src.id and "lawful" in c.tags) - \
+                sum(1 for c in ctx.present if c.id != src.id and "chaotic" in c.tags)
+            return float(max(pts, 0) ** 2), True
         if sf == "check_patron":
             return (1.0 if self.patron_id else 0.0), True
         if sf in ("per_crusader", "per_hero", "per_tagged_crusader_mult"):
@@ -784,6 +815,36 @@ class Scorer:
                         slots |= t
             return float(len(slots & ctx.occupied)), exact
         raise _Unmodelled
+
+    def _banked_stacks(self, e: Effect) -> float | None:
+        """Stacks for manual mechanics we can still pin down:
+
+        * an account stat the game saves for it (Dob's Deposit stacks), or
+        * the upgrade's own cap, ``stacks_max_stack_expr`` (Rust's Riches:
+          ceil(highest area / 5)), at ``run_area`` × the stack assumption.
+        """
+        if e.upgrade_id is None:
+            return None
+        up = self.data.upgrades.get(e.upgrade_id)
+        if up is None:
+            return None
+        for other in up.effects:
+            stat = _ACCOUNT_STACK_STATS.get(other.key)
+            if stat and stat in self.account_stacks:
+                return self.account_stacks[stat]
+        for other in up.effects:
+            if other.key == "stacks_max_stack_expr" and len(other.args) > 1:
+                expr = ",".join(other.args[1:])
+                try:
+                    from ..model.expr import BASE_FUNCS, evaluate_with
+                    names = {"highest_available_area": self.run_area, "highest_area": self.run_area}
+                    v = float(evaluate_with(expr, lambda n: names[n], BASE_FUNCS))
+                except (UnsupportedExpr, KeyError, ValueError, TypeError):
+                    return None
+                if other.raw.get("rounding_mode") == "ceil":
+                    v = math.ceil(v)
+                return max(0.0, v) * self.stack_fraction
+        return None
 
     # -- targeting -------------------------------------------------------
     def _targets_carry(self, e: Effect, src: Champion, src_slot: int, ctx: _Ctx) -> bool:

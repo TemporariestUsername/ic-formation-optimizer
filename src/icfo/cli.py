@@ -152,6 +152,8 @@ def _scorer_factory(data: GameData, user: UserState, args):
             scorer.apply_account(user)
         scorer.stack_overrides = dict(stacks)
         scorer.stack_fraction = args.stack_assumption
+        if getattr(args, "run_area", None):
+            scorer.run_area = float(args.run_area)
         if bonuses is not None:
             p = patron if patron_override is None else patron_override
             scorer.set_bonuses(bonuses.effects_for(adventure_id, p), p)
@@ -349,7 +351,7 @@ def cmd_sweep(args) -> None:
         stack_fraction=args.stack_assumption,
         stack_overrides=_load_stacks(args.stacks, data) if args.stacks else None,
         tiers=[t.strip() for t in args.tiers.split(",") if t.strip()],
-        bonuses=make.bonuses, patron=make.patron,
+        bonuses=make.bonuses, patron=make.patron, run_area=args.run_area,
     )
     print(json.dumps(summary, indent=2))
     print(f"wrote {args.out}" + (f" and {args.json}" if args.json else ""))
@@ -412,7 +414,9 @@ def main(argv: list[str] | None = None) -> None:
                         help="theory-craft: own every champion, default specs, no gear")
         sp.add_argument("--stacks", help='JSON stack assumptions, e.g. {"Walnut:Pen-Paws": 20, "11654": 60}')
         sp.add_argument("--no-calibration", action="store_true", help="don't anchor damage to your progress")
-        sp.add_argument("--no-bonuses", action="store_true", help="ignore blessings and patron perks")
+        sp.add_argument("--no-bonuses", action="store_true", help="ignore blessings, patron perks and favor gold")
+        sp.add_argument("--run-area", type=float,
+                        help="area a run reaches, for caps like Rust's Riches (default: your deepest instance)")
         sp.add_argument("--patron", help="play under a patron: Mirt, Vajra, Strahd, Zariel, Elminster")
         sp.add_argument("--stack-assumption", type=float, default=1.0,
                         help="share of max stacks assumed for kill/attack/timer stacks (1 = full, 0 = ignore)")
