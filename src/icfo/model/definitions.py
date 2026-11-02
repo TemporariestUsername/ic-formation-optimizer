@@ -64,6 +64,30 @@ class Feat:
     hero_id: int
     name: str
     effects: list[Effect]
+    sources: tuple[str, ...] = ()  # "default", "gems", "premium", "promo", "event", ...
+    gem_cost: int | None = None  # listed gem price (12,500 gem-shop; 50,000 via collections)
+    available: bool = True
+
+    @property
+    def tier(self) -> str:
+        """Acquisition tier: "free"; "gems" (has a listed gem price: 12,500 in the gem
+        shop or 50,000 via collections); "full" (everything else obtainable:
+        platinum-only shop/DLC, events, chests, patron shops, campaign rewards)."""
+        if "default" in self.sources:
+            return "free"
+        if self.gem_cost is not None:
+            return "gems"
+        return "full"
+
+    def describe_source(self) -> str:
+        if self.tier == "free":
+            return "free"
+        if self.tier == "gems":
+            other = [x for x in self.sources if x != "gems"]
+            return f"{self.gem_cost:,} gems" + (f" (or {'/'.join(other)})" if other else "")
+        other = [s for s in self.sources if s != "gems"]
+        price = f" or {self.gem_cost:,} gems" if self.gem_cost and "gems" in self.sources else ""
+        return "/".join(other or ["shop"]) + price
 
 
 @dataclass
@@ -184,12 +208,21 @@ class GameData:
             champ = self.champions.get(_int(f.get("hero_id")))
             if champ is None:
                 continue
+            srcs = [s for s in f.get("sources") or [] if isinstance(s, dict)]
+            cs = f.get("collections_source") if isinstance(f.get("collections_source"), dict) else {}
+            gem_costs = [_int(s.get("cost")) for s in srcs if s.get("source") == "gems" and s.get("cost")]
+            if cs.get("type") == "gems" and cs.get("cost"):
+                gem_costs.append(_int(cs.get("cost")))
+            props = f.get("properties") if isinstance(f.get("properties"), dict) else {}
             champ.feats.append(
                 Feat(
                     id=_int(f.get("id")),
                     hero_id=champ.id,
                     name=str(f.get("name") or ""),
                     effects=normalize(f.get("effects"), self.effect_defines, hero_id=champ.id, feat_id=_int(f.get("id"))),
+                    sources=tuple(str(s.get("source")) for s in srcs),
+                    gem_cost=min(gem_costs) if gem_costs else None,
+                    available=bool(props.get("is_available", True)) and cs.get("type") != "not_yet_available",
                 )
             )
         self.feats: dict[int, Feat] = {f.id: f for c in self.champions.values() for f in c.feats}

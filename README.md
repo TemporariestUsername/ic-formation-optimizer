@@ -10,7 +10,19 @@ them at once, for three goals:
 | `gems` | boss areas per hour × gems per boss, to a reset area | Briv jumps, Thellora's start skip, spawn/quest/time-scale effects, Ellywick's gem cards, plus a damage floor |
 
 It uses your real account data (owned champions, specializations, feats, gear) and
-the game's own definitions. It picks the carry automatically.
+the game's own definitions. It picks the carry, specializations and feats automatically.
+
+Every result comes in three **optimums**:
+
+| Tier | Feats allowed | Output |
+|---|---|---|
+| `base` | the feats you own (free choice of which to equip) | best formation on your current account |
+| `gems` ("almost full") | + feats with a gem price (12,500 gem shop, or 50,000 via collections) | what to buy and the gem total |
+| `full` | + everything obtainable: platinum-only shop/DLC, event, chest, patron and campaign feats | what to acquire and from where |
+
+Tiers build on each other (each starts from the previous answer and only accepts
+improvements), so `full ≥ gems ≥ base`. A feat you'd have to acquire must beat what you
+own by about 0.5%, so purchases are never recommended for noise.
 
 ## How it works
 
@@ -118,7 +130,8 @@ icfo optimize 469 --mode gems --reset-area 900
 icfo optimize 469 --carry Havilar --profile fast
 icfo optimize 4 --all-champions     # theory-craft: own everyone, default specs, no gear
 
-icfo sweep --out sweep.csv          # all ~1,985 adventures × 3 modes (~1 h on 4 cores)
+icfo sweep --out sweep.csv          # all ~1,985 adventures × 3 modes × 3 tiers (~2-3 h on 4 cores)
+icfo sweep --tiers base             # current account only (~1 h)
 icfo sweep --modes gems --adventures 1,4,469 --profile thorough
 icfo coverage
 icfo stacks Walnut "Commodore Krux"  # runtime-stacked effects and their upgrade ids
@@ -197,9 +210,10 @@ contains personal data (email, linked accounts). Only the fields listed in
    (`expression_on_trigger`, `broadcast_on_trigger`, `*_stacks` keys, Aerois Synergy,
    Mithral Hall), starting with the supports that show up most in optimized formations.
    Also: effects conditional on specific feats, and `affected_by_upgrade` filters.
-2. **Account fidelity.** Specs, feats and gear are applied, and the planner picks the
-   best specialization per formation and objective. Still missing: feat selection,
-   legendaries, familiars, blessings and patron perks.
+2. **Account fidelity.** Specs, feats and gear are applied, and the planner picks
+   specializations and feats per formation, objective and tier. Still missing:
+   blessings (local/global, via `getcampaigndetails`), patron perks, legendaries and
+   familiars.
 3. **Better carry comparison.** Add levels and ultimates to the base-attack model.
 4. **Pairwise CP-SAT terms.** Add product variables for interactions the surrogate
    misses, such as an amplifier boosting a positional buff.

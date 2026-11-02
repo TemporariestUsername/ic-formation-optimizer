@@ -139,7 +139,8 @@ def test_sweep_groups_and_writes_csv(tmp_path):
                         workers=1, use_account=False)
     assert summary["adventures"] == 2 and summary["groups"] == 2 and summary["errors"] == 0
     rows = list(csv.DictReader(out.open()))
-    assert {(r["adventure_id"], r["mode"]) for r in rows} == {("1", "push"), ("1", "favor"), ("2", "push"), ("2", "favor")}
+    assert {(r["adventure_id"], r["mode"], r["tier"]) for r in rows} == {
+        (a, m, t) for a in ("1", "2") for m in ("push", "favor") for t in ("base", "gems", "full")}
     assert all(r["carry"] == "Carry" for r in rows)
     assert all("3:" not in r["formation"] for r in rows if r["adventure_id"] == "2")  # slot 3 is blocked there
 
@@ -160,7 +161,8 @@ def test_gem_multiplier_from_ellywick_cards():
     assert m["ellywick_gem_cards"] == pytest.approx(2.0)  # 5-card hand x 40% gem odds
     assert m["gem_multiplier"] == pytest.approx(1.30)
     assert m["rel_gems_per_hour"] == pytest.approx(m["boss_areas_per_hour"] * 1.30, abs=0.1)
-    u.feats[83] = (1880,)  # "Gem" feat: hand fills with gem cards
+    # "Gem" feat equipped (its effect is in the formation): the hand fills with gem cards
+    res.speed.append(SpeedEffect("Ellywick", 83, "ellywick_gem_prioritized", (), None, 1.0, {}))
     assert obj.model(res, data.champions[1], {0: data.champions[1]})["gem_multiplier"] == pytest.approx(1.75)
 
 
@@ -172,3 +174,35 @@ def test_formula_parameters_receive_their_buffs():
     data = build(HEROES, [(10, 2, "effect_def,1"), (20, 3, "buff_upgrade,100,10,0")], [(1, keys)])
     assert score(data, {0: 1, 1: 2}).log10 == pytest.approx(L(1.5))
     assert score(data, {0: 1, 1: 2, 2: 3}).log10 == pytest.approx(L(2.0))  # 50% -> 100%
+
+
+def test_tiers_are_monotone_and_list_purchases():
+    from icfo.optimize.planner import feat_choices, plan_tiers
+    defs = {**DEFS, "hero_feat_defines": [
+        {"id": 7, "hero_id": 1, "name": "Owned", "effects": [{"effect_string": "global_dps_multiplier_mult,10"}],
+         "sources": [{"source": "gems", "cost": 12500}]},
+        {"id": 8, "hero_id": 1, "name": "GemShop", "effects": [{"effect_string": "global_dps_multiplier_mult,100"}],
+         "sources": [{"source": "gems", "cost": 12500}]},
+        {"id": 9, "hero_id": 1, "name": "Platinum", "effects": [{"effect_string": "global_dps_multiplier_mult,900"}],
+         "sources": [{"source": "premium", "premium_item_id": 1}]},
+        {"id": 10, "hero_id": 1, "name": "Free", "effects": [{"effect_string": "global_dps_multiplier_mult,1"}],
+         "sources": [{"source": "default"}]},
+    ]}
+    data = GameData(defs)
+    u = UserState.from_details(USER)
+    u.unlocked_feats[1] = {7}
+    u.feat_slots[1] = 1
+    carry = data.champions[1]
+    assert [f.name for f in feat_choices(carry, u, "base")] == ["Owned", "Free"]
+    assert [f.name for f in feat_choices(carry, u, "gems")] == ["Owned", "GemShop", "Free"]
+    assert len(feat_choices(carry, u, "full")) == 4
+    c = constraints_for(data, 1)
+    s = Scorer(data, c.layout)
+    s.apply_account(u)
+    tiers = plan_tiers(ObjectiveScorer(s, PushObjective(data)), c, candidate_pool(list(data.champions.values()), c, u.owned),
+                       u, carry, "fast")
+    assert tiers["base"].value <= tiers["gems"].value <= tiers["full"].value
+    assert tiers["base"].feats[1] == (7,) and not tiers["base"].purchases
+    assert [f.name for _, f in tiers["gems"].purchases] == ["GemShop"] and tiers["gems"].gem_cost == 12500
+    assert [f.name for _, f in tiers["full"].purchases] == ["Platinum"] and tiers["full"].gem_cost == 0
+    assert tiers["full"].value - tiers["base"].value == pytest.approx(L(10) - L(1.1))

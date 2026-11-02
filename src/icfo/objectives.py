@@ -40,7 +40,6 @@ from .model.user import UserState
 BRIV_ID = 58
 THELLORA_ID = 139
 ELLYWICK_ID = 83
-ELLYWICK_GEM_FEAT = 1880  # "Gem": gem cards prioritized
 
 
 # -- progression ---------------------------------------------------------------
@@ -314,7 +313,7 @@ class GemObjective:
                 per_card = s.amount
                 draws = completed * kills / max(1.0, float(deck.raw.get("monster_kills_for_card_draw", 25)))
                 draws = min(draws, run_s / max(1.0, float(deck.raw.get("card_draw_cooldown", 60))))
-                prioritized = ELLYWICK_GEM_FEAT in self.user.feats.get(ELLYWICK_ID, ())
+                prioritized = any(x.key == "ellywick_gem_prioritized" for x in res.speed)
                 share = 1.0 if prioritized else float(deck.raw.get("gem_odds", 20)) / 100
                 gem_cards = min(p.ellywick_hand, draws) * share
                 bonus += gem_cards * per_card

@@ -146,4 +146,5 @@ SPEED_KEYS = frozenset({
     "increase_boss_gems_percent",
     "increase_boss_gems",
     "ellywick_deck_of_many_things",
+    "ellywick_gem_prioritized",  # "Gem" feat
 })

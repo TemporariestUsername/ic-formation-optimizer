@@ -21,7 +21,7 @@ from ..model.definitions import GameData, LayoutNotFound
 from ..model.user import UserState
 from ..model.variants import Constraints, constraints_for
 from ..objectives import Calibration, FavorObjective, GemObjective, GemParams, ObjectiveScorer, PushObjective
-from .planner import plan
+from .planner import TIERS, plan, plan_tiers
 from .search import Infeasible, candidate_pool
 
 MODES = ("push", "favor", "gems")
@@ -78,48 +78,75 @@ def _solve(job: _Job) -> list[dict]:
     oscorers = {m: ObjectiveScorer(scorer, o) for m, o in objectives.items()}
 
     account_specs = {h: dict(v) for h, v in scorer.specs.items()}
+    account_feats = dict(scorer.feats)
+    tiers = tuple(_STATE.get("tiers") or ("base",))
 
-    def use_specs(specs):
+    def use(specs, feats):
         scorer.specs = {h: dict(v) for h, v in account_specs.items()}
-        for h, v in specs.items():
-            scorer.specs[h] = dict(v)
+        scorer.specs.update({h: dict(v) for h, v in specs.items()})
+        scorer.feats = dict(account_feats)
+        scorer.feats.update(feats)
         scorer.invalidate()
 
-    found = {}
+    found: dict[tuple[str, str], tuple] = {}
     errors = {}
     for m in job.modes:
-        use_specs({})
+        use({}, {})
         try:
-            p = plan(oscorers[m], constraints, pool, None, _STATE["profile"])
-            found[m] = (p.carry, p.placement, p.specs, p.spec_changes)
+            if tiers == ("base",) and not _STATE.get("feat_choice", True):
+                p = plan(oscorers[m], constraints, pool, None, _STATE["profile"])
+                found[(m, "base")] = (p.carry, p.placement, p.specs, dict(account_feats), p.spec_changes)
+            else:
+                tp = plan_tiers(oscorers[m], constraints, pool, user, None, _STATE["profile"], tiers)
+                for t, plan_t in tp.items():
+                    found[(m, t)] = (plan_t.plan.carry, plan_t.plan.placement, plan_t.plan.specs,
+                                     plan_t.feats, plan_t.plan.spec_changes)
         except Infeasible as exc:
             errors[m] = str(exc)
 
     rows = []
-    for m in job.modes:
-        row = {"group": job.group, "mode": m}
-        if not found:
-            rows.append({**row, "error": errors.get(m, "no feasible formation")})
-            continue
-        best = None
-        for src_mode, (carry, placement, specs, changes) in found.items():
-            use_specs(specs)
-            res = oscorers[m].score(placement, carry.id)
-            if best is None or res.log10 > best[0].log10:
-                best = (res, carry, placement, src_mode, changes)
-        res, carry, placement, src_mode, changes = best
-        rows.append({
-            **row,
-            "carry": carry.name,
-            "formation": "; ".join(f"{s}:{c.name}" for s, c in sorted(placement.items())),
-            "value": round(res.log10, 3),
-            "found_by": src_mode,
-            "spec_changes": "; ".join(f"{c}: {a} -> {b}" for c, a, b in changes),
-            "coverage": round(res.coverage, 3),
-            "approx_share": round(res.approx_share, 3),
-            "warnings": " | ".join(constraints.warnings),
-            **objectives[m].summary(res, carry, placement),
-        })
+    for ti, t in enumerate(tiers):
+        allowed_tiers = set(tiers[: ti + 1])  # a richer tier may reuse a poorer tier's answer
+        for m in job.modes:
+            row = {"group": job.group, "mode": m, "tier": t}
+            cands = [(k, v) for k, v in found.items() if k[1] in allowed_tiers]
+            if not cands:
+                rows.append({**row, "error": errors.get(m, "no feasible formation")})
+                continue
+            best = None
+            for (src_mode, src_tier), (carry, placement, specs, feats, changes) in cands:
+                use(specs, feats)
+                res = oscorers[m].score(placement, carry.id)
+                if best is None or res.log10 > best[0].log10 + 1e-9:
+                    best = (res, carry, placement, src_mode, changes, feats)
+            res, carry, placement, src_mode, changes, feats = best
+            purchases = []
+            for ch in placement.values():
+                for fid in feats.get(ch.id, ()):
+                    f = data.feats.get(fid)
+                    if f is not None and f.tier != "free" and fid not in user.unlocked_feats.get(ch.id, set()):
+                        purchases.append((ch.name, f))
+            feat_changes = []
+            for ch in placement.values():
+                now = tuple(feats.get(ch.id, ()))
+                if now != tuple(account_feats.get(ch.id, ())):
+                    names = ", ".join(data.feats[f].name for f in now if f in data.feats) or "(none)"
+                    feat_changes.append(f"{ch.name}: {names}")
+            rows.append({
+                **row,
+                "carry": carry.name,
+                "formation": "; ".join(f"{sl}:{c.name}" for sl, c in sorted(placement.items())),
+                "value": round(res.log10, 3),
+                "found_by": src_mode,
+                "spec_changes": "; ".join(f"{c}: {a} -> {b}" for c, a, b in changes),
+                "feats": " | ".join(feat_changes),
+                "to_acquire": "; ".join(f"{c}: {f.name} ({f.describe_source()})" for c, f in purchases),
+                "gem_cost": sum(f.gem_cost or 0 for _, f in purchases if f.tier == "gems"),
+                "coverage": round(res.coverage, 3),
+                "approx_share": round(res.approx_share, 3),
+                "warnings": " | ".join(constraints.warnings),
+                **objectives[m].summary(res, carry, placement),
+            })
     return rows
 
 
@@ -138,6 +165,7 @@ def run_sweep(
     gem_params: GemParams | None = None,
     stack_fraction: float = 1.0,
     stack_overrides: dict[int, float] | None = None,
+    tiers: Iterable[str] = TIERS,
     progress: Callable[[int, int], None] | None = None,
 ) -> dict:
     champs = list(data.champions.values())
@@ -157,7 +185,7 @@ def run_sweep(
 
     _STATE.update(data=data, user=user, calibration=calibration, profile=profile,
                   use_account=use_account, gem_params=gem_params,
-                  stack_fraction=stack_fraction, stack_overrides=stack_overrides)
+                  stack_fraction=stack_fraction, stack_overrides=stack_overrides, tiers=tuple(tiers))
     started = time.time()
     results: list[dict] = []
     if workers > 1:
@@ -173,23 +201,25 @@ def run_sweep(
             if progress:
                 progress(i + 1, len(jobs))
 
-    by_key = {(r["group"], r["mode"]): r for r in results}
+    tiers = tuple(tiers)
+    by_key = {(r["group"], r["mode"], r["tier"]): r for r in results}
     rows = []
     for gi, members in enumerate(group_list):
         for aid in members:
             adv = data.adventures[aid]
-            for m in modes:
-                r = by_key[(gi, m)]
-                rows.append({
-                    "adventure_id": aid,
-                    "adventure": adv.name,
-                    "campaign_id": adv.campaign_id,
-                    "variant_of": adv.variant_of or "",
-                    "restrictions": " ".join(adv.restrictions_text.split())[:300],
-                    "group_size": len(members),
-                    **{k: v for k, v in r.items() if k != "group"},
-                })
-    rows.sort(key=lambda r: (r["adventure_id"], MODES.index(r["mode"])))
+            for t in tiers:
+                for m in modes:
+                    r = by_key[(gi, m, t)]
+                    rows.append({
+                        "adventure_id": aid,
+                        "adventure": adv.name,
+                        "campaign_id": adv.campaign_id,
+                        "variant_of": adv.variant_of or "",
+                        "restrictions": " ".join(adv.restrictions_text.split())[:300],
+                        "group_size": len(members),
+                        **{k: v for k, v in r.items() if k != "group"},
+                    })
+    rows.sort(key=lambda r: (r["adventure_id"], MODES.index(r["mode"]), tiers.index(r["tier"])))
     fields: list[str] = []
     for r in rows:
         for k in r:

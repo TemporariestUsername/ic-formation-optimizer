@@ -101,6 +101,22 @@ def _priority_tag(scorer) -> str | None:
     return {"gems": "speed", "favor": "gold"}.get(name)
 
 
+def _channel_keys(scorer) -> frozenset:
+    from ..engine.catalog import GOLD_KEYS, SPEED_KEYS
+    name = getattr(getattr(scorer, "objective", None), "name", None)
+    return {"gems": SPEED_KEYS, "favor": GOLD_KEYS}.get(name, frozenset())
+
+
+def _touches_channel(champ: Champion, keys, feats=()) -> bool:
+    """Has an effect (from upgrades or the given feats) in the objective's channel."""
+    if not keys:
+        return False
+    for u in champ.upgrades:
+        if any(e.key in keys for e in u.effects):
+            return True
+    return any(e.key in keys for f in feats for e in f.effects)
+
+
 def prune_pool(scorer, constraints: Constraints, pool: list[Champion], carry: Champion, keep: int) -> list[Champion]:
     k = _anchor_slot(constraints, carry)
     if k is None:
@@ -128,11 +144,12 @@ def prune_pool(scorer, constraints: Constraints, pool: list[Champion], carry: Ch
     gains.sort(key=lambda t: -t[0])
     kept = {c.id: c for _, c in gains[:keep]}
     role = _priority_tag(scorer)
+    keys = _channel_keys(scorer)
     for c in pool:
-        # variant requirements must stay available; so must the objective's role
-        # champions, whose value marginal damage probes can't see
+        # variant requirements must stay available; so must champions serving the
+        # objective's channel (speed/gems, gold), whose value damage probes can't see
         if (c.id in constraints.required_ids or any(r(c) for r in constraints.forced_slot_rules.values())
-                or (role and role in c.tags and c.seat != carry.seat)):
+                or (c.seat != carry.seat and ((role and role in c.tags) or _touches_channel(c, keys, c.feats)))):
             kept.setdefault(c.id, c)
     kept[carry.id] = carry
     return list(kept.values())
@@ -224,3 +241,161 @@ def plan(scorer, constraints: Constraints, pool: list[Champion], carry: Champion
                 best_res, best_carry = cand, c
     final, specs, changes = optimize_specs(scorer, best_res.placement, best_carry)
     return Plan(best_carry, best_res.placement, final, evals, [c.name for c in shortlist], specs, changes)
+
+
+# -- feats and acquisition tiers -------------------------------------------------
+
+TIERS = ("base", "gems", "full")
+TIER_LABELS = {
+    "base": "current account (owned feats, free choice of which to equip)",
+    "gems": "almost full (+ feats with a gem price)",
+    "full": "full (+ platinum-only shop, event, chest, patron and campaign feats)",
+}
+
+
+def feat_choices(champ: Champion, user, tier: str) -> list:
+    """Feats a champion may equip in ``tier``."""
+    owned = user.unlocked_feats.get(champ.id, set()) if user.from_account else set()
+    out = []
+    for f in champ.feats:
+        if f.id in owned or f.tier == "free" and f.available:
+            out.append(f)
+        elif tier in ("gems", "full") and f.tier == "gems" and f.available:
+            out.append(f)
+        elif tier == "full" and f.available:
+            out.append(f)
+    return out
+
+
+def _relevant(feat) -> bool:
+    """Skip feats whose effects can't move any score (pure bookkeeping/cosmetic)."""
+    from ..engine.catalog import NON_DAMAGE_KEYS, PARAM_KEYS
+    return any(e.key not in PARAM_KEYS and e.key not in NON_DAMAGE_KEYS for e in feat.effects)
+
+
+PURCHASE_MARGIN = 0.002  # log10 (~0.5%): a feat you'd have to buy must clearly beat what you own
+
+
+def optimize_feats(scorer, placement: dict[int, Champion], carry: Champion, user, tier: str, rounds: int = 1):
+    """Coordinate ascent over each placed champion's feat slots.
+
+    Starts from what's equipped (kept where nothing modelled beats it), then
+    tries every allowed feat in every slot. Leaves the scorer set to the
+    chosen feats; returns (result, {hero: feat ids}).
+    """
+    base = scorer.scorer if hasattr(scorer, "scorer") else scorer
+    best = scorer.score(placement, carry.id)
+    for _ in range(rounds):
+        improved = False
+        for champ in placement.values():
+            options = [f for f in feat_choices(champ, user, tier) if _relevant(f)]
+            if not options:
+                continue
+            allowed = {f.id for f in feat_choices(champ, user, tier)}
+            n_slots = user.feat_slots.get(champ.id, 4) if user.from_account else 4
+            current = [f for f in base.feats.get(champ.id, ()) if f in allowed][:n_slots]
+            current += [None] * (n_slots - len(current))
+            owned = user.unlocked_feats.get(champ.id, set()) if user.from_account else set()
+            for slot in range(n_slots):
+                for f in options:
+                    if f.id in current:
+                        continue
+                    trial = list(current)
+                    trial[slot] = f.id
+                    base.feats[champ.id] = tuple(x for x in trial if x is not None)
+                    base.invalidate(champ.id)
+                    res = scorer.score(placement, carry.id)
+                    margin = 1e-6 if (f.id in owned or f.tier == "free") else PURCHASE_MARGIN
+                    if res.log10 > best.log10 + margin:
+                        best, current, improved = res, trial, True
+                base.feats[champ.id] = tuple(x for x in current if x is not None)
+                base.invalidate(champ.id)
+        if not improved:
+            break
+    chosen = {c.id: tuple(base.feats.get(c.id, ())) for c in placement.values()}
+    return scorer.score(placement, carry.id), chosen
+
+
+def _prefit_feats(scorer, constraints, candidates, placement, carry, user, tier) -> None:
+    """Give each champion outside the formation its best feats next to the carry
+    in isolation, so the re-search can see what new feats make them worth."""
+    k = next((sl for sl, ch in placement.items() if ch.id == carry.id), None)
+    if k is None:
+        return
+    layout = constraints.layout
+    near = [sl for sl in constraints.open_slots if sl != k and sl in layout.slots[k].adj] or \
+           [sl for sl in constraints.open_slots if sl != k]
+    if not near:
+        return
+    placed = {ch.id for ch in placement.values()}
+    keys = _channel_keys(scorer)
+    for c in candidates:
+        if c.id in placed or c.seat == carry.seat:
+            continue
+        options = [f for f in feat_choices(c, user, tier) if _relevant(f)]
+        if not options:
+            continue
+        if keys and not _touches_channel(c, keys, options) and tier == "base":
+            continue
+        optimize_feats(scorer, {k: carry, near[0]: c}, carry, user, tier)
+
+
+@dataclass
+class TierPlan:
+    tier: str
+    plan: Plan
+    feats: dict[int, tuple[int, ...]]  # hero -> equipped feat ids in this optimum
+    purchases: list  # [(champion name, Feat)] not yet owned
+    gem_cost: int
+
+    @property
+    def value(self) -> float:
+        return self.plan.result.log10
+
+
+def plan_tiers(scorer, constraints: Constraints, pool: list[Champion], user, carry: Champion | None = None,
+               profile: str = "fast", tiers=TIERS, seed: int = 0) -> dict[str, TierPlan]:
+    """Base / almost-full / full optimum. Each tier starts from the previous
+    tier's formation and feats and only accepts improvements, so the values
+    are monotone (full >= gems >= base)."""
+    cfg = PROFILES[profile]
+    base = scorer.scorer if hasattr(scorer, "scorer") else scorer
+    data = base.data
+    out: dict[str, TierPlan] = {}
+    prev: Plan | None = None
+    for tier in tiers:
+        if prev is None:
+            p = plan(scorer, constraints, pool, carry, profile, seed=seed)
+        else:
+            p = prev
+        placement, c = dict(p.placement), p.carry
+        res, _ = optimize_feats(scorer, placement, c, user, tier)
+        # the formation may change once feats change: pre-fit feats for candidates
+        # outside the formation, re-search briefly, then re-fit feats/specs
+        sub = prune_pool(scorer, constraints, pool, c, cfg["keep"])
+        _prefit_feats(scorer, constraints, sub, placement, c, user, tier)
+        again = anneal(scorer, constraints, sub, c, start=placement, iterations=max(300, cfg["iters"] // 2),
+                       t_start=0.1, seed=seed + 7)
+        if again.score.log10 > res.log10 + 1e-9:
+            placement = again.placement
+        res, specs, changes = optimize_specs(scorer, placement, c)
+        res, feats = optimize_feats(scorer, placement, c, user, tier)
+        if prev is not None and res.log10 < prev.result.log10:
+            # never report a worse optimum for a richer tier
+            res, placement, specs, changes = prev.result, prev.placement, prev.specs, prev.spec_changes
+            feats = out[tiers[tiers.index(tier) - 1]].feats
+            for h, f in feats.items():
+                base.feats[h] = f
+                base.invalidate(h)
+        tp = Plan(c, placement, res, p.evaluations, p.carries_tried, specs, list(p.spec_changes) + changes)
+        owned = user.unlocked_feats
+        purchases = []
+        for champ in placement.values():
+            for fid in feats.get(champ.id, ()):
+                feat = data.feats.get(fid)
+                if feat is not None and feat.tier != "free" and fid not in owned.get(champ.id, set()):
+                    purchases.append((champ.name, feat))
+        cost = sum(f.gem_cost or 0 for _, f in purchases if f.tier == "gems")
+        out[tier] = TierPlan(tier, tp, feats, purchases, cost)
+        prev = tp
+    return out

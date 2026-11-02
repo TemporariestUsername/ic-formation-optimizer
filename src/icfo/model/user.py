@@ -68,6 +68,8 @@ class UserState:
     levels: dict[int, int] = field(default_factory=dict)
     spec_choices: dict[int, list[int]] = field(default_factory=dict)  # hero -> chosen spec upgrade ids
     feats: dict[int, tuple[int, ...]] = field(default_factory=dict)  # hero -> active feat ids
+    unlocked_feats: dict[int, set[int]] = field(default_factory=dict)  # hero -> owned feat ids
+    feat_slots: dict[int, int] = field(default_factory=dict)
     gear: dict[int, list[GearItem]] = field(default_factory=dict)
     stats: dict[str, str] = field(default_factory=dict)
     instances: list[GameInstance] = field(default_factory=list)
@@ -83,6 +85,8 @@ class UserState:
         levels: dict[int, int] = {}
         specs: dict[int, list[int]] = {}
         feats: dict[int, tuple[int, ...]] = {}
+        unlocked: dict[int, set[int]] = {}
+        slots: dict[int, int] = {}
         hero_raw: dict[int, dict] = {}
         for h in details.get("heroes") or []:
             hid = _int(h.get("hero_id"), -1)
@@ -94,6 +98,8 @@ class UserState:
             levels[hid] = _int(h.get("level"))
             specs[hid] = [_int(x) for x in h.get("specialization_choices") or []]
             feats[hid] = tuple(_int(x) for x in h.get("active_feats") or [])
+            unlocked[hid] = {_int(x) for x in h.get("unlocked_feats") or []}
+            slots[hid] = _int(h.get("feat_slots"), 4)
         gear: dict[int, list[GearItem]] = {}
         for item in details.get("loot") or []:
             g = GearItem(
@@ -125,6 +131,8 @@ class UserState:
             levels=levels,
             spec_choices=specs,
             feats=feats,
+            unlocked_feats=unlocked,
+            feat_slots=slots,
             gear=gear,
             stats={str(k): str(v) for k, v in (details.get("stats") or {}).items()},
             instances=instances,

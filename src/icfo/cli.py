@@ -26,7 +26,7 @@ from .fetch import Cache, Credentials, IdleChampionsClient
 from .model import GameData, UserState, constraints_for
 from .objectives import GemParams, ObjectiveScorer, calibrate
 from .optimize import Infeasible, anneal, candidate_pool, greedy
-from .optimize.planner import plan
+from .optimize.planner import TIER_LABELS, plan_tiers
 from .optimize.sweep import make_objective, run_sweep
 
 def _load_defs(args) -> GameData:
@@ -192,8 +192,15 @@ def cmd_optimize(args) -> None:
 
     try:
         if args.solver == "planner":
-            p = plan(oscorer, constraints, pool, carry, args.profile, seed=args.seed)
-            carry, placement, sc, evals, tried = p.carry, p.placement, p.result, p.evaluations, p.carries_tried
+            tier_names = [t.strip() for t in args.tiers.split(",") if t.strip()]
+            tiers = plan_tiers(oscorer, constraints, pool, user, carry, args.profile, tier_names, seed=args.seed)
+            base_tier = tiers[tier_names[0]]
+            p = base_tier.plan
+            for h, f in base_tier.feats.items():  # report the first tier with its own feats
+                oscorer.scorer.feats[h] = f
+                oscorer.scorer.invalidate(h)
+            carry, placement, evals, tried = p.carry, p.placement, p.evaluations, p.carries_tried
+            sc = oscorer.score(placement, carry.id)
             spec_changes = p.spec_changes
         else:
             if carry is None:
@@ -207,12 +214,15 @@ def cmd_optimize(args) -> None:
                 r = anneal(oscorer, constraints, pool, carry, iterations=args.iterations, seed=args.seed)
             placement, sc, evals, tried = r.placement, r.score, r.evaluations, [carry.name]
             spec_changes = []
+            tiers, tier_names = {}, []
     except Infeasible as exc:
         sys.exit(f"infeasible: {exc}")
 
     adv = data.adventures[args.adventure]
     labels = {i: "XX" for i in constraints.blocked_slots}
     labels.update({s: c.name for s, c in placement.items()})
+    if tiers:
+        print(f"== {TIER_LABELS[tier_names[0]]} ==")
     print(f"{adv.name} (id {adv.id}) - mode: {args.mode}, carry: {carry.name}"
           + (f"  (auto, compared: {', '.join(tried)})" if len(tried) > 1 else ""))
     print(f"account: {'yours (specs, feats, gear applied)' if user.from_account else 'theory (owns everything, default specs)'}\n")
@@ -258,6 +268,35 @@ def cmd_optimize(args) -> None:
             print(f"  {name:<20} " + ", ".join(f"{k}×{n}" for k, n in keys.most_common(4)))
     for w in constraints.warnings:
         print("warning:", w)
+    _print_tiers(data, constraints, tiers, tier_names, objective, user)
+
+
+def _print_tiers(data, constraints, tiers, tier_names, objective, user) -> None:
+    if not tiers:
+        return
+    first = tiers[tier_names[0]]
+    for name in tier_names:
+        t = tiers[name]
+        current_feats = {h: tuple(user.feats.get(h, ())) for h in t.feats}
+        print(f"\n== {TIER_LABELS[name]} ==")
+        print(f"  objective {t.value:.2f}" + (f"  ({t.value - first.value:+.2f} vs base)" if name != tier_names[0] else ""))
+        if name != tier_names[0] and t.plan.placement != first.plan.placement:
+            labels = {i: "XX" for i in constraints.blocked_slots}
+            labels.update({sl: c.name for sl, c in t.plan.placement.items()})
+            print(constraints.layout.render(labels, width=12))
+        for h, feats in sorted(t.feats.items()):
+            if feats != current_feats.get(h, ()):
+                names = ", ".join(data.feats[f].name for f in feats if f in data.feats) or "(none)"
+                print(f"  feats {data.champions[h].name:<16} {names}")
+        if t.purchases:
+            print("  to acquire:")
+            for champ, feat in t.purchases:
+                print(f"    {champ:<16} {feat.name:<28} {feat.describe_source()}")
+            if t.gem_cost:
+                print(f"    gem total: {t.gem_cost:,}")
+        summary = objective.summary(t.plan.result, t.plan.carry, t.plan.placement)
+        keys = [k for k in ("est_area", "log10_damage", "log10_favor_rel", "rel_gems_per_hour", "gem_multiplier") if k in summary]
+        print("  " + ", ".join(f"{k} {summary[k]}" for k in keys))
 
 
 def cmd_sweep(args) -> None:
@@ -280,6 +319,7 @@ def cmd_sweep(args) -> None:
         use_account=user.from_account, gem_params=_gem_params(args, user), progress=progress,
         stack_fraction=args.stack_assumption,
         stack_overrides=_load_stacks(args.stacks, data) if args.stacks else None,
+        tiers=[t.strip() for t in args.tiers.split(",") if t.strip()],
     )
     print(json.dumps(summary, indent=2))
     print(f"wrote {args.out}" + (f" and {args.json}" if args.json else ""))
@@ -360,6 +400,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--mode", choices=["push", "favor", "gems"], default="push")
     s.add_argument("--carry", default="auto", help="champion name/id, or auto (default)")
     s.add_argument("--solver", choices=["planner", "anneal", "greedy", "cpsat"], default="planner")
+    s.add_argument("--tiers", default="base,gems,full",
+                   help="optimums to compute: base (owned feats), gems (+gem-priced feats), full (+everything)")
     s.add_argument("--iterations", type=int, default=20000)
     s.add_argument("--seed", type=int, default=0)
     account_args(s)
@@ -373,6 +415,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--workers", type=int, default=4)
     s.add_argument("--adventures", help="comma-separated ids (default: all)")
     s.add_argument("--limit", type=int, help="only the first N adventures (for a quick look)")
+    s.add_argument("--tiers", default="base,gems,full", help="optimums per row: base, gems, full")
     account_args(s)
     mode_args(s)
     s.set_defaults(func=cmd_sweep)
