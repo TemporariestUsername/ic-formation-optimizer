@@ -143,3 +143,36 @@ def test_extended_relations():
     assert layout.targets("front_2_columns", 8) == {0, 1, 2}
     assert layout.targets("top_row_of_each_column", 0) == {0, 1, 3, 6, 8}
     assert layout.targets({"type": "col_and_back_x", "num_back_cols": 1}, 1) == {1, 2, 3, 4, 5}
+
+
+def test_tag_expression_and_compounds():
+    tags = {"chaotic", "good", "human"}
+    assert match_tags("chaotic^good", tags)
+    assert match_tags("lawful_good|chaotic_good", tags)
+    assert not match_tags("lawful_good|chaotic_evil", tags)
+
+
+def test_key_champion_exempt_and_forced_heroes_provided(data):
+    from icfo.optimize import candidate_pool
+
+    # "Tanking Expectations": no tanks allowed, except the key champion in slot 0
+    data.champions[3].tags = frozenset({"support", "dwarf", "tanking"})
+    data.adventures[2].game_changes = [
+        {"type": "only_allow_crusaders", "by_tags": {"tags": "!tanking"}},
+        {"type": "key_champion", "by_tags": {"tags": "tanking"}, "force_slot": True, "slot_id": 0},
+        {"type": "force_use_heroes", "hero_ids": [5, 999]},
+    ]
+    c = constraints_for(data, 2)
+    ch = data.champions
+    assert c.placement_ok({0: ch[3], 1: ch[1], 2: ch[5]})  # tank allowed in its key slot
+    assert not c.placement_ok({1: ch[3], 0: ch[1], 2: ch[5]})  # ...but nowhere else
+    assert any("999" in w for w in c.warnings)  # unknown forced hero dropped
+    pool = {x.id for x in candidate_pool(list(ch.values()), c, owned={1, 3})}
+    assert pool == {1, 3, 5}  # Rival (5) is forced in even though not owned
+
+
+def test_escort_stage_follows_objective_area(data):
+    data.adventures[2].objective_area = 75
+    data.adventures[2].game_changes = [{"type": "slot_escort_by_area", "escorts": [
+        {"min_area": 1, "slot_ids": [3]}, {"min_area": 51, "slot_ids": [3, 2]}, {"min_area": 101, "slot_ids": [3, 2, 1, 0]}]}]
+    assert constraints_for(data, 2).blocked_slots == {2, 3}

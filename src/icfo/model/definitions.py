@@ -135,6 +135,7 @@ class Adventure:
     variant_of: int | None
     restrictions_text: str
     game_changes: list[dict]
+    objective_area: int | None = None  # "complete_area" goal, if any
 
 
 class GameData:
@@ -155,7 +156,8 @@ class GameData:
                 name=str(h["name"]),
                 seat=seat,
                 tags=frozenset(str(t) for t in h.get("tags") or []),
-                stats={str(k).lower(): _int(v) for k, v in (scores or {}).items()},
+                stats={**{str(k).lower(): _int(v) for k, v in (scores or {}).items()},
+                       **({"age": _int(sheet.get("age"))} if isinstance(sheet, dict) and "age" in sheet else {})},
                 species=_species(sheet.get("race") if isinstance(sheet, dict) else None, h.get("tags") or []),
                 base_damage=_float(h.get("base_damage"), 1.0),
                 base_attack_id=_int(h.get("base_attack_id")),
@@ -218,6 +220,8 @@ class GameData:
                 campaign_id=_int(a.get("campaign_id")),
                 variant_of=_int(a.get("variant_adventure_id")) or None,
                 restrictions_text=str(a.get("restrictions_text") or ""),
+                objective_area=next((_int(o.get("area")) for o in a.get("objectives") or []
+                                     if isinstance(o, dict) and o.get("condition") == "complete_area"), None),
                 game_changes=[g for g in a.get("game_changes") or [] if isinstance(g, dict)],
             )
 

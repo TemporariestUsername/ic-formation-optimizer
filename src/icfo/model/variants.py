@@ -79,7 +79,11 @@ class Constraints:
         """Check a full ``slot -> champion`` placement against every constraint."""
         seats: set[int] = set()
         for slot, champ in placement.items():
-            if slot in self.blocked_slots or not self.allows(champ):
+            if slot in self.blocked_slots:
+                return False
+            # a key champion in its forced slot is exempt from the allow rules (as in game)
+            forced = slot in self.forced_slot_rules and self.forced_slot_rules[slot](champ)
+            if not forced and not self.allows(champ):
                 return False
             if champ.seat in seats:
                 return False
@@ -181,7 +185,11 @@ def constraints_for(data: GameData, adventure_id: int) -> Constraints:
             if rule is not None:
                 (c.allow_rules if kind == "only_allow_crusaders" else c.ban_rules).append(rule)
         elif kind == "force_use_heroes":
-            c.required_ids |= {int(i) for i in gc.get("hero_ids", [])}
+            for hid in (int(i) for i in gc.get("hero_ids", [])):
+                if hid in data.champions:
+                    c.required_ids.add(hid)
+                else:
+                    c.warnings.append(f"forced hero {hid} is not a playable champion; ignored")
             if gc.get("forced_slots"):
                 c.warnings.append("force_use_heroes.forced_slots (moving required champion) not modelled")
         elif kind == "slot_escort":
@@ -191,9 +199,11 @@ def constraints_for(data: GameData, adventure_id: int) -> Constraints:
             c.blocked_slots |= {int(s) for s in slots or []}
         elif kind == "slot_escort_by_area":
             escorts = sorted(gc.get("escorts", []), key=lambda e: e.get("min_area", 0))
-            if escorts:
-                c.blocked_slots |= {int(s) for s in escorts[-1].get("slot_ids", [])}
-                c.warnings.append("slot_escort_by_area: using the latest (most restrictive) stage")
+            target = adv.objective_area or 250
+            active = [e for e in escorts if e.get("min_area", 0) <= target] or escorts[:1]
+            if active:
+                c.blocked_slots |= {int(s) for s in active[-1].get("slot_ids", [])}
+                c.warnings.append(f"slot_escort_by_area: using the stage active at area {target} (the objective)")
         elif kind == "max_active_by_tags":
             c.max_by_tag.update({str(k): int(v) for k, v in (gc.get("tag_maxes") or {}).items()})
             if gc.get("excluded_heroes"):

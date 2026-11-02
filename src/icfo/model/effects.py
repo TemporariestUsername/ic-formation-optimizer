@@ -25,6 +25,7 @@ patch any field and the derived properties follow.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
@@ -190,18 +191,26 @@ def _normalize_into(out, value, effect_defines, hero_id, upgrade_id, feat_id, de
 def match_tags(expr: str, tags: Iterable[str]) -> bool:
     """Evaluate a tag expression such as ``dwarf``, ``!human`` or ``druid|ranger``.
 
-    ``|`` is OR, ``&`` is AND (binds tighter), leading ``!`` negates a term.
+    ``|`` is OR; ``&`` and ``^`` are AND (bind tighter); a leading ``!`` negates
+    a term. Compound terms that aren't tags themselves (``lawful_good``) mean all
+    of their parts (``lawful`` AND ``good``).
     """
     tagset = set(tags)
+
+    def has(name: str) -> bool:
+        if name in tagset:
+            return True
+        parts = name.split("_")
+        return len(parts) > 1 and all(p in tagset for p in parts)
+
     for alt in str(expr).split("|"):
         ok = True
-        for term in alt.split("&"):
+        for term in re.split(r"[&^]", alt):
             term = term.strip()
             if not term:
                 continue
             neg = term.startswith("!")
-            name = term.lstrip("!")
-            if (name in tagset) == neg:
+            if has(term.lstrip("!")) == neg:
                 ok = False
                 break
         if ok:

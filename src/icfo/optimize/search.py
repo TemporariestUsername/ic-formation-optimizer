@@ -31,7 +31,16 @@ class SearchResult:
 
 
 def candidate_pool(champions: list[Champion], constraints: Constraints, owned: set[int]) -> list[Champion]:
-    return [c for c in champions if c.id in owned and constraints.allows(c)]
+    """Owned, allowed champions, plus champions the variant forces in (the game
+    provides those even if not owned) and owned key champions for forced slots
+    (exempt from the allow rules)."""
+    out = []
+    for c in champions:
+        if c.id in constraints.required_ids:
+            out.append(c)
+        elif c.id in owned and (constraints.allows(c) or any(r(c) for r in constraints.forced_slot_rules.values())):
+            out.append(c)
+    return out
 
 
 def _seed(constraints: Constraints, pool: list[Champion], carry: Champion, carry_slot: int) -> Placement:
