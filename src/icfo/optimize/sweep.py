@@ -12,6 +12,7 @@ from __future__ import annotations
 import csv
 import json
 import multiprocessing as mp
+import os
 import time
 from dataclasses import dataclass
 from typing import Callable, Iterable
@@ -168,6 +169,7 @@ def run_sweep(
     adventure_ids: Iterable[int] | None = None,
     use_account: bool = True,
     gem_params: GemParams | None = None,
+    checkpoint: str | None = None,
     stack_fraction: float = 1.0,
     stack_overrides: dict[int, float] | None = None,
     tiers: Iterable[str] = TIERS,
@@ -198,21 +200,53 @@ def run_sweep(
                   stack_fraction=stack_fraction, stack_overrides=stack_overrides, tiers=tuple(tiers),
                   bonuses=bonuses, patron=patron, run_area=run_area)
     started = time.time()
-    results: list[dict] = []
-    if workers > 1:
-        ctx = mp.get_context("fork")
-        with ctx.Pool(workers) as pool:
-            for i, r in enumerate(pool.imap_unordered(_solve, jobs, chunksize=1)):
-                results.extend(r)
-                if progress:
-                    progress(i + 1, len(jobs))
-    else:
-        for i, job in enumerate(jobs):
-            results.extend(_solve(job))
-            if progress:
-                progress(i + 1, len(jobs))
-
+    # checkpoint: one line per solved group, so an interrupted sweep resumes
+    checkpoint = checkpoint or out_csv + ".partial.jsonl"
     tiers = tuple(tiers)
+
+    def ckey(members) -> str:
+        return json.dumps([members, list(modes), list(tiers), profile])
+
+    done: dict[str, list[dict]] = {}
+    if os.path.exists(checkpoint):
+        with open(checkpoint, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                    done[rec["key"]] = rec["rows"]
+                except (json.JSONDecodeError, KeyError):
+                    continue  # a line cut off by an interruption
+    results: list[dict] = []
+    todo = []
+    for job in jobs:
+        prior = done.get(ckey(group_list[job.group]))
+        if prior is not None:
+            results.extend({**r, "group": job.group} for r in prior)
+        else:
+            todo.append(job)
+    resumed = len(jobs) - len(todo)
+
+    def keep(rows: list[dict], f) -> None:
+        results.extend(rows)
+        gi = rows[0]["group"]
+        f.write(json.dumps({"key": ckey(group_list[gi]),
+                            "rows": [{k: v for k, v in r.items() if k != "group"} for r in rows]}) + "\n")
+        f.flush()
+
+    with open(checkpoint, "a", encoding="utf-8") as ck:
+        if workers > 1 and todo:
+            ctx = mp.get_context("fork")
+            with ctx.Pool(workers) as pool:
+                for i, r in enumerate(pool.imap_unordered(_solve, todo, chunksize=1)):
+                    keep(r, ck)
+                    if progress:
+                        progress(resumed + i + 1, len(jobs))
+        else:
+            for i, job in enumerate(todo):
+                keep(_solve(job), ck)
+                if progress:
+                    progress(resumed + i + 1, len(jobs))
+
     by_key = {(r["group"], r["mode"], r["tier"]): r for r in results}
     rows = []
     for gi, members in enumerate(group_list):
@@ -244,7 +278,9 @@ def run_sweep(
         with open(out_json, "w", encoding="utf-8") as f:
             json.dump({"calibration": None if calibration is None else vars(calibration),
                        "profile": profile, "rows": rows}, f)
+    os.remove(checkpoint)  # complete: the CSV/JSON now hold everything
     return {
+        "resumed_groups": resumed,
         "adventures": sum(len(m) for m in group_list),
         "groups": len(group_list),
         "jobs": len(jobs),

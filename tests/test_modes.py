@@ -206,3 +206,21 @@ def test_tiers_are_monotone_and_list_purchases():
     assert [f.name for _, f in tiers["gems"].purchases] == ["GemShop"] and tiers["gems"].gem_cost == 12500
     assert [f.name for _, f in tiers["full"].purchases] == ["Platinum"] and tiers["full"].gem_cost == 0
     assert tiers["full"].value - tiers["base"].value == pytest.approx(L(10) - L(1.1))
+
+
+def test_sweep_resumes_from_checkpoint(tmp_path):
+    import json as _json
+    data = GameData(DEFS)
+    u = UserState.everything(set(data.champions))
+    out = tmp_path / "s.csv"
+    ck = tmp_path / "s.csv.partial.jsonl"
+    # pretend adventure 1's group was already solved (marker carry name)
+    key = _json.dumps([[1], ["push"], ["base"], "fast"])
+    ck.write_text(_json.dumps({"key": key, "rows": [{"mode": "push", "tier": "base", "carry": "FROM-CHECKPOINT"}]}) + "\n"
+                  + '{"key": "cut off mid-wri')  # a line truncated by an interruption is ignored
+    summary = run_sweep(data, u, ["push"], calibration=None, out_csv=str(out), workers=1,
+                        use_account=False, tiers=["base"])
+    assert summary["resumed_groups"] == 1 and summary["errors"] == 0
+    rows = {r["adventure_id"]: r for r in csv.DictReader(out.open())}
+    assert rows["1"]["carry"] == "FROM-CHECKPOINT" and rows["2"]["carry"] == "Carry"
+    assert not ck.exists()  # removed once complete
