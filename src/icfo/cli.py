@@ -6,6 +6,7 @@
     icfo layout 4                         # show layout + parsed variant rules
     icfo optimize 4 --carry Nrakk         # best formation for a carry
     icfo coverage                         # which effect types are still unmodelled
+    icfo stacks Walnut Krux               # runtime-stacked effects you can set with --stacks
 """
 
 from __future__ import annotations
@@ -16,18 +17,10 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from .engine.score import AMPLIFIER_KEYS, NON_DAMAGE_KEYS, Scorer
+from .engine.score import Scorer, static_class
 from .fetch import Cache, Credentials, IdleChampionsClient
 from .model import GameData, UserState, constraints_for
 from .optimize import Infeasible, anneal, candidate_pool, greedy
-
-MODELLED_KEYS = {
-    "global_dps_multiplier_mult",
-    "hero_dps_multiplier_mult",
-    "hero_dps_mult_per_tagged_crusader_mult",
-    "hero_dps_mult_per_target_crusader",
-} | AMPLIFIER_KEYS
-
 
 def _load_defs(args) -> GameData:
     if args.defs:
@@ -46,6 +39,42 @@ def _load_user(args, data: GameData) -> UserState:
     if cached is None:
         sys.exit("No user data: run `icfo fetch-user`, pass --user FILE, or use --all-champions.")
     return UserState.from_details(cached)
+
+
+def _load_stacks(path: str, data: GameData) -> dict[int, float]:
+    """Stack assumptions file: {"<upgrade id>": stacks} or {"Champion:Upgrade name": stacks}."""
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    out: dict[int, float] = {}
+    for key, value in raw.items():
+        if str(key).isdigit():
+            out[int(key)] = float(value)
+            continue
+        champ_name, _, upgrade_name = str(key).partition(":")
+        champ = data.champion(champ_name.strip())
+        matches = [u for u in champ.upgrades if (u.name or u.specialization_name or "").casefold() == upgrade_name.strip().casefold()]
+        if not matches:
+            raise KeyError(f"{champ.name} has no upgrade named {upgrade_name.strip()!r}")
+        for u in matches:
+            out[u.id] = float(value)
+    return out
+
+
+def cmd_stacks(args) -> None:
+    """List runtime-stacked effects for champions, to fill a --stacks file."""
+    data = _load_defs(args)
+    for name in args.champions:
+        champ = data.champion(name)
+        print(f"{champ.name}:")
+        for u in champ.upgrades:
+            for e in u.effects:
+                if e.triggered or (e.stack_func and e.stack_func not in ("per_hero_attribute", "per_crusader", "per_hero",
+                                                                          "per_tagged_crusader_mult", "adjacent_champions",
+                                                                          "per_unique_race", "per_upgrade_targets")):
+                    how = e.raw.get("stacks_on_trigger") or e.stack_func or "manual"
+                    cap = f"max {e.max_stacks:g}" if e.max_stacks else "no cap"
+                    print(f"  {u.id:>6}  {(u.name or u.specialization_name or '?')[:28]:<28} {e.key:<28} {str(how)[:28]:<28} {cap}")
+                    break
 
 
 def cmd_fetch_defs(args) -> None:
@@ -103,6 +132,8 @@ def cmd_optimize(args) -> None:
         sys.exit(f"{carry.name} is not allowed in this adventure.")
     pool = candidate_pool(list(data.champions.values()), constraints, user.owned)
     scorer = Scorer(data, constraints.layout)
+    if args.stacks:
+        scorer.stack_overrides = _load_stacks(args.stacks, data)
 
     try:
         if args.solver == "greedy":
@@ -118,14 +149,20 @@ def cmd_optimize(args) -> None:
     labels = {i: "XX" for i in constraints.blocked_slots}
     labels.update({s: c.name for s, c in result.placement.items()})
     print(constraints.layout.render(labels, width=12))
-    print(f"\nformation multiplier on {carry.name}: x10^{result.score.log10:.2f}"
-          f"   (effect coverage {result.score.coverage:.0%}, {result.evaluations} evaluations)")
+    sc = result.score
+    print(f"\nformation multiplier on {carry.name}: x10^{sc.log10:.2f}   ({result.evaluations} evaluations)")
+    print(f"effect coverage {sc.coverage:.0%} of {sc.modelled_exact + sc.modelled_approx + sum(sc.unmodelled.values())} "
+          f"relevant effects; {sc.approx_share:.0%} of the score assumes max stacks / full uptime")
     by_source: Counter = Counter()
+    approx_by_source: Counter = Counter()
     for contrib in result.score.contributions:
         by_source[contrib.source] += contrib.log10
+        if not contrib.exact:
+            approx_by_source[contrib.source] += contrib.log10
     print("\ncontributions (log10):")
     for name, val in by_source.most_common():
-        print(f"  {name:<20} {val:+8.2f}")
+        note = f"   ({approx_by_source[name]:+.2f} assumed)" if approx_by_source[name] else ""
+        print(f"  {name:<20} {val:+8.2f}{note}")
     if result.score.unmodelled_by_hero:
         print("\nunmodelled effects (result may under/over-rate these champions):")
         for name, keys in sorted(result.score.unmodelled_by_hero.items()):
@@ -136,20 +173,32 @@ def cmd_optimize(args) -> None:
 
 def cmd_coverage(args) -> None:
     data = _load_defs(args)
-    counts: Counter = Counter()
+    layout = data.layout_for(1)
+    classes: Counter = Counter()
+    unmodelled: Counter = Counter()
+    champs_by_key: dict[str, set[str]] = {}
     for champ in data.champions.values():
         for e in champ.effects():
-            counts[e.key] += 1
-    total = sum(counts.values())
-    modelled = sum(n for k, n in counts.items() if k in MODELLED_KEYS)
-    ignored = sum(n for k, n in counts.items() if k in NON_DAMAGE_KEYS)
+            cls = static_class(e, layout)
+            classes[cls] += 1
+            if cls == "unmodelled":
+                unmodelled[e.key] += 1
+                champs_by_key.setdefault(e.key, set()).add(champ.name)
+    total = sum(classes.values())
     print(f"effects on all champions (default specs, max level): {total}")
-    print(f"  modelled:   {modelled:>6} ({modelled / total:.0%})")
-    print(f"  non-damage: {ignored:>6} ({ignored / total:.0%})")
-    print(f"  unmodelled: {total - modelled - ignored:>6} ({(total - modelled - ignored) / total:.0%})")
-    print(f"\ntop {args.top} unmodelled effect keys:")
-    for k, n in [(k, n) for k, n in counts.most_common() if k not in MODELLED_KEYS | NON_DAMAGE_KEYS][: args.top]:
-        print(f"  {n:>5}  {k}")
+    groups = [
+        ("scored exactly", ("damage", "amplifier", "modifier")),
+        ("scored, assumes max stacks/uptime", ("approx",)),
+        ("safely ignored (bookkeeping, non-damage, self-only)", ("param", "non_damage", "intrinsic")),
+        ("unmodelled", ("unmodelled",)),
+    ]
+    for label, members in groups:
+        n = sum(classes[m] for m in members)
+        print(f"  {n:>6} ({n / total:5.1%})  {label}")
+    print(f"\ntop {args.top} unmodelled effect keys (by champions affected):")
+    ranked = sorted(champs_by_key, key=lambda k: (-len(champs_by_key[k]), -unmodelled[k]))
+    for k in ranked[: args.top]:
+        print(f"  {len(champs_by_key[k]):>3} champions  {unmodelled[k]:>4} effects  {k}")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -180,7 +229,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--seed", type=int, default=0)
     s.add_argument("--user", help="getuserdetails JSON file")
     s.add_argument("--all-champions", action="store_true", help="pretend every champion is owned")
+    s.add_argument("--stacks", help='JSON stack assumptions, e.g. {"Walnut:Pen-Paws": 20, "11654": 60}')
     s.set_defaults(func=cmd_optimize)
+
+    s = sub.add_parser("stacks", help="list runtime-stacked effects (for --stacks)")
+    s.add_argument("champions", nargs="+")
+    s.set_defaults(func=cmd_stacks)
 
     s = sub.add_parser("coverage")
     s.add_argument("--top", type=int, default=25)

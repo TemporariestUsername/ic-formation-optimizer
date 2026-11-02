@@ -97,11 +97,17 @@ class Layout:
             if kind == "distance":
                 d = int(relation.get("distance", 1))
                 return frozenset(i for i, k in self.distances(src).items() if 0 < k <= d)
-            if kind in ("by_tags", "attack_type"):
-                return self.all
+            if kind == "col_and_back_x":
+                n = int(relation.get("num_back_cols", 1))
+                return frozenset().union(*(self.column(self.slots[src].col + i) for i in range(n + 1)))
+            if kind in ("by_tags", "tags", "attack_type"):
+                return self.all  # occupant-dependent: the engine filters
             return None
         rel = str(relation)
         col = s.col
+        ahead = adj & self.column(col - 1)
+        behind = adj & self.column(col + 1)
+        front_col = min(x.col for x in self.slots)
         table = {
             "self": frozenset({src}),
             "self_slot": frozenset({src}),
@@ -117,10 +123,25 @@ class Layout:
             "col_and_prev_col": self.column(col) | self.column(col + 1),
             "prev_two_col": self.column(col + 1) | self.column(col + 2),
             "back_2_columns": self.column(col + 1) | self.column(col + 2),
-            "ahead": adj & self.column(col - 1),
-            "behind": adj & self.column(col + 1),
+            "next_two_col": self.column(col - 1) | self.column(col - 2),
+            "prev_and_next_col": self.column(col - 1) | self.column(col + 1),
+            "self_and_prev_two_col": frozenset({src}) | self.column(col + 1) | self.column(col + 2),
+            "front_2_columns": self.column(front_col) | self.column(front_col + 1),
+            "top_row_of_each_column": self._top_of_each_column(),
+            "ahead": ahead,
+            "behind": behind,
+            "self_and_ahead": ahead | {src},
+            "col_and_behind": self.column(col) | behind,
+            "self_and_behind_and_ahead": ahead | behind | {src},
         }
         return table.get(rel)
+
+    def _top_of_each_column(self) -> frozenset[int]:
+        top: dict[int, Slot] = {}
+        for s in self.slots:
+            if s.col not in top or s.y < top[s.col].y:
+                top[s.col] = s
+        return frozenset(s.index for s in top.values())
 
     def render(self, labels: dict[int, str], width: int = 10) -> str:
         """ASCII picture: front (col 0) on the right, as in game."""

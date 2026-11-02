@@ -1,23 +1,31 @@
 """Effect parsing.
 
 Game effects are strings like ``hero_dps_multiplier_mult,100`` wrapped in
-loosely-typed objects. The same concept shows up in several shapes in the
-definitions (observed in live data):
+loosely-typed objects. Shapes observed in live data:
 
 * a bare string:            ``"hero_dps_multiplier_mult,100"``
 * a JSON-encoded string:    ``'{"effect_string":"buff_upgrade,50,12"}'``
 * an indirection:           ``"effect_def,310"`` -> ``effect_defines[310].effect_keys``
+* several indirections:     ``"effect_def,234,235,236,237"``
 * ``effect_keys`` as a list of objects, a single object, or plain strings
 * the string under ``effect_string`` or (rarely) ``effect``
 * ``targets`` as a list, a string, an int, or missing (= the source itself)
 
-``normalize`` flattens all of that into a list of :class:`Effect`.
+Amounts are not always in the string: ``pre_stack_amount,60`` next to
+``hero_dps_multiplier_mult,0`` + ``"amount_expr": "upgrade_amount(12982,0)"``
+means "the real amount is effect #0 of upgrade 12982". Those formulas are
+resolved by :class:`~icfo.model.definitions.GameData` after loading, and the
+result is stored on the effect (``resolved_amount``).
+
+``normalize`` flattens all of that into a list of :class:`Effect`. Each effect
+keeps its full raw key, so upgrade modifiers (``change_upgrade_data``) can
+patch any field and the derived properties follow.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable
 
 MAX_EFFECT_DEF_DEPTH = 5
@@ -27,19 +35,89 @@ MAX_EFFECT_DEF_DEPTH = 5
 class Effect:
     key: str
     args: tuple[str, ...]
-    targets: tuple[Any, ...] = ("self",)
-    filters: tuple[Any, ...] = ()
-    stacks_multiply: bool = False
-    exclude_self: bool = False
+    raw: dict = field(default_factory=dict, compare=False, hash=False, repr=False)
     hero_id: int | None = None
     upgrade_id: int | None = None
-    raw: dict = field(default_factory=dict, compare=False, hash=False, repr=False)
+    feat_id: int | None = None
+    index: int = 0  # position among the upgrade's/feat's effect keys
+    resolved_amount: float | None = None  # from amount_expr, when present
 
+    # -- arguments ---------------------------------------------------------
     def num(self, i: int, default: float = 0.0) -> float:
         try:
             return float(self.args[i])
         except (IndexError, ValueError):
             return default
+
+    @property
+    def base_amount(self) -> float | None:
+        """The effect's numeric amount, or None if it can't be determined."""
+        if "amount_expr" in self.raw:
+            return self.resolved_amount
+        if not self.args:
+            return 0.0
+        try:
+            return float(self.args[0])
+        except ValueError:
+            return None  # e.g. "$replace": supplied by a system we don't model
+
+    # -- targeting ---------------------------------------------------------
+    @property
+    def targets(self) -> tuple[Any, ...]:
+        return tuple(_as_list(self.raw.get("targets"))) or ("self",)
+
+    @property
+    def filters(self) -> tuple[Any, ...]:
+        return tuple(_as_list(self.raw.get("filter_targets")))
+
+    @property
+    def exclude_self(self) -> bool:
+        return bool(self.raw.get("exclude_self"))
+
+    # -- stacking ----------------------------------------------------------
+    @property
+    def stacks_multiply(self) -> bool:
+        return bool(self.raw.get("stacks_multiply"))
+
+    @property
+    def stack_func(self) -> str | None:
+        f = self.raw.get("stack_func")
+        return str(f) if f else None
+
+    @property
+    def amount_func(self) -> str | None:
+        f = self.raw.get("amount_func")
+        return str(f) if f else None
+
+    @property
+    def max_stacks(self) -> float | None:
+        v = self.raw.get("max_stacks")
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    @property
+    def triggered(self) -> bool:
+        """Stacks or activates at runtime (kills, attacks, timers, manual logic)."""
+        return "stacks_on_trigger" in self.raw or bool(self.raw.get("manual_stacking"))
+
+    @property
+    def manually_stacked(self) -> bool:
+        """Stacks driven by champion-specific code, not a generic trigger."""
+        trig = self.raw.get("stacks_on_trigger")
+        return bool(self.raw.get("manual_stacking")) or trig in ("will_stack_manually", "will_manually_stack")
+
+    @property
+    def timed(self) -> bool:
+        return "for_time" in self.raw
+
+    # -- modification ------------------------------------------------------
+    def patched(self, data: dict) -> "Effect":
+        """A copy with raw fields overridden (``change_upgrade_data``)."""
+        raw = {**self.raw, **data}
+        args = self.args
+        if "amount" in data and isinstance(data["amount"], (int, float)):
+            args = (str(data["amount"]), *self.args[1:])
+            raw.pop("amount_expr", None)
+        return replace(self, raw=raw, args=args)
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -76,64 +154,37 @@ def normalize(
     *,
     hero_id: int | None = None,
     upgrade_id: int | None = None,
-    _depth: int = 0,
+    feat_id: int | None = None,
 ) -> list[Effect]:
     out: list[Effect] = []
+    _normalize_into(out, value, effect_defines, hero_id, upgrade_id, feat_id, 0, None)
+    return [replace(e, index=i) for i, e in enumerate(out)]
+
+
+def _normalize_into(out, value, effect_defines, hero_id, upgrade_id, feat_id, depth, wrapper_targets):
     for raw in _as_list(value):
         entry = _coerce_entry(raw)
         if entry is None:
             continue
         key, *args = [p.strip() for p in entry["effect_string"].split(",")]
-        if key == "effect_def" and args and _depth < MAX_EFFECT_DEF_DEPTH:
-            try:
-                target_def = effect_defines.get(int(args[0]))
-            except ValueError:
-                target_def = None
-            if target_def is not None:
-                inner = normalize(
-                    target_def.get("effect_keys"),
-                    effect_defines,
-                    hero_id=hero_id,
-                    upgrade_id=upgrade_id,
-                    _depth=_depth + 1,
-                )
-                # Targets on the wrapper override defaults on inner keys that had none.
-                if "targets" in entry:
-                    tgt = tuple(_as_list(entry["targets"]))
-                    inner = [
-                        e if "targets" in e.raw else _replace_targets(e, tgt) for e in inner
-                    ]
-                out.extend(inner)
+        if key == "effect_def":
+            if depth >= MAX_EFFECT_DEF_DEPTH:
+                continue
+            targets = entry.get("targets", wrapper_targets)
+            for ref in args:  # "effect_def,234,235,236" -> all four
+                try:
+                    target_def = effect_defines.get(int(ref))
+                except ValueError:
+                    target_def = None
+                if target_def is not None:
+                    _normalize_into(
+                        out, target_def.get("effect_keys"), effect_defines,
+                        hero_id, upgrade_id, feat_id, depth + 1, targets,
+                    )
             continue
-        targets = tuple(_as_list(entry.get("targets"))) or ("self",)
-        out.append(
-            Effect(
-                key=key,
-                args=tuple(args),
-                targets=targets,
-                filters=tuple(_as_list(entry.get("filter_targets"))),
-                stacks_multiply=bool(entry.get("stacks_multiply")),
-                exclude_self=bool(entry.get("exclude_self")),
-                hero_id=hero_id,
-                upgrade_id=upgrade_id,
-                raw=entry,
-            )
-        )
-    return out
-
-
-def _replace_targets(e: Effect, targets: tuple[Any, ...]) -> Effect:
-    return Effect(
-        key=e.key,
-        args=e.args,
-        targets=targets,
-        filters=e.filters,
-        stacks_multiply=e.stacks_multiply,
-        exclude_self=e.exclude_self,
-        hero_id=e.hero_id,
-        upgrade_id=e.upgrade_id,
-        raw=e.raw,
-    )
+        if "targets" not in entry and wrapper_targets is not None:
+            entry = {**entry, "targets": wrapper_targets}
+        out.append(Effect(key=key, args=tuple(args), raw=entry, hero_id=hero_id, upgrade_id=upgrade_id, feat_id=feat_id))
 
 
 def match_tags(expr: str, tags: Iterable[str]) -> bool:

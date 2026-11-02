@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from functools import cached_property
 from typing import Any
 
 from .effects import Effect, normalize
+from .expr import BASE_FUNCS, UnsupportedExpr, evaluate_with
 from .formation import Layout
+
+
+def _species(race: Any, tags: list) -> str | None:
+    """Map the character-sheet race ("Dwarf (Shield)", "Half-Orc") to its tag."""
+    if not isinstance(race, str):
+        return None
+    slug = re.sub(r"\s*\(.*\)", "", race).strip().lower().replace(" ", "-")
+    tagset = {str(t) for t in tags}
+    if slug in tagset:
+        return slug
+    last = slug.split("-")[-1]  # "wood-elf" -> "elf"
+    return last if last in tagset else slug or None
 
 
 class LayoutNotFound(KeyError):
@@ -52,6 +66,7 @@ class Champion:
     seat: int
     tags: frozenset[str]
     stats: dict[str, int] = field(default_factory=dict)  # ability scores: str, dex, ...
+    species: str | None = None  # race tag, e.g. "dwarf", "half-orc" (for per-unique-species effects)
     upgrades: list[Upgrade] = field(default_factory=list)
     feats: list[Feat] = field(default_factory=list)
 
@@ -132,6 +147,7 @@ class GameData:
                 seat=seat,
                 tags=frozenset(str(t) for t in h.get("tags") or []),
                 stats={str(k).lower(): _int(v) for k, v in (scores or {}).items()},
+                species=_species(sheet.get("race") if isinstance(sheet, dict) else None, h.get("tags") or []),
             )
         self.upgrades: dict[int, Upgrade] = {}
         for u in defs.get("upgrade_defines") or []:
@@ -160,9 +176,18 @@ class GameData:
                     id=_int(f.get("id")),
                     hero_id=champ.id,
                     name=str(f.get("name") or ""),
-                    effects=normalize(f.get("effects"), self.effect_defines, hero_id=champ.id),
+                    effects=normalize(f.get("effects"), self.effect_defines, hero_id=champ.id, feat_id=_int(f.get("id"))),
                 )
             )
+        self.feats: dict[int, Feat] = {f.id: f for c in self.champions.values() for f in c.feats}
+        self._resolve_amounts()
+        # Upgrades holding a pre_stack parameter: buffs to them scale the
+        # per-stack amount ("Buffs apply to the pre-stack value"). Everywhere
+        # else buff_upgrade is "post stack" (game key notes).
+        self.pre_stack_uids: frozenset[int] = frozenset(
+            u.id for u in self.upgrades.values()
+            if any(e.key in ("pre_stack", "pre_stack_amount") for e in u.effects)
+        )
         self.campaigns: dict[int, dict] = {
             _int(c.get("id")): c for c in defs.get("campaign_defines") or []
         }
@@ -176,6 +201,64 @@ class GameData:
                 restrictions_text=str(a.get("restrictions_text") or ""),
                 game_changes=[g for g in a.get("game_changes") or [] if isinstance(g, dict)],
             )
+
+    # -- amount formulas -------------------------------------------------------
+    def _effect_amount(self, effects: list[Effect], index: Any, depth: int) -> float:
+        if not isinstance(index, int) or not 0 <= index < len(effects):
+            raise UnsupportedExpr(f"effect index {index!r}")
+        e = effects[index]
+        if "amount_expr" in e.raw:
+            if depth > 4:
+                raise UnsupportedExpr("amount formula nests too deep")
+            return self._eval_amount(e.raw["amount_expr"], depth + 1)
+        amount = e.base_amount
+        if amount is None:
+            raise UnsupportedExpr(f"non-numeric amount in {e.key}")
+        return amount
+
+    def _eval_amount(self, expr: str, depth: int = 0) -> float:
+        def upgrade_amount(uid, idx):
+            up = self.upgrades.get(int(uid))
+            if up is None:
+                raise UnsupportedExpr(f"unknown upgrade {uid}")
+            return self._effect_amount(up.effects, idx, depth)
+
+        def feat_amount(fid, idx):
+            feat = self.feats.get(int(fid))
+            if feat is None:
+                raise UnsupportedExpr(f"unknown feat {fid}")
+            return self._effect_amount(feat.effects, idx, depth)
+
+        funcs = {**BASE_FUNCS, "upgrade_amount": upgrade_amount,
+                 "max_upgrade_amount": upgrade_amount, "feat_amount": feat_amount}
+
+        def names(name: str):
+            raise KeyError(name)
+
+        value = evaluate_with(str(expr), names, funcs)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise UnsupportedExpr(f"amount formula {expr!r} is not numeric")
+        return float(value)
+
+    def _resolve_amounts(self) -> None:
+        """Fill ``resolved_amount`` for effects whose amount lives in a formula."""
+        def resolve(effects: list[Effect]) -> list[Effect]:
+            out = []
+            for e in effects:
+                if "amount_expr" in e.raw:
+                    try:
+                        e = replace(e, resolved_amount=self._eval_amount(e.raw["amount_expr"]))
+                    except (UnsupportedExpr, ValueError, TypeError):
+                        pass  # stays None -> reported as unmodelled
+                out.append(e)
+            return out
+
+        resolved_up = {uid: resolve(u.effects) for uid, u in self.upgrades.items()}
+        resolved_feat = {fid: resolve(f.effects) for fid, f in self.feats.items()}
+        for uid, effs in resolved_up.items():
+            self.upgrades[uid].effects = effs
+        for fid, effs in resolved_feat.items():
+            self.feats[fid].effects = effs
 
     # -- lookups -------------------------------------------------------------
     def champion(self, name_or_id: str | int) -> Champion:

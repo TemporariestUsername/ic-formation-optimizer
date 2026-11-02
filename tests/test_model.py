@@ -132,3 +132,14 @@ def test_criteria_within_one_entry_are_alternatives(data):
     c = constraints_for(data, 2)
     allowed = {ch.name for ch in data.champions.values() if c.allows(ch)}
     assert allowed == {"Adjy", "Rival", "Ampy", "Counter", "Globo"}  # Globo (seat 3) is forced in
+
+
+def test_extended_relations():
+    layout = Layout.from_game_change(DIAMOND)
+    assert layout.targets("next_two_col", 6) == {1, 2, 3, 4, 5}
+    assert layout.targets("prev_and_next_col", 4) == {1, 2, 6, 7}
+    assert layout.targets("self_and_behind_and_ahead", 3) == {1, 3, 6}
+    assert layout.targets("col_and_behind", 0) == {0, 1, 2}
+    assert layout.targets("front_2_columns", 8) == {0, 1, 2}
+    assert layout.targets("top_row_of_each_column", 0) == {0, 1, 3, 6, 8}
+    assert layout.targets({"type": "col_and_back_x", "num_back_cols": 1}, 1) == {1, 2, 3, 4, 5}
