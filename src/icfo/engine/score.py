@@ -38,9 +38,12 @@ from ..model.definitions import Champion, GameData
 from ..model.effects import Effect, match_tags
 from ..model.expr import UnsupportedExpr, evaluate
 from ..model.formation import Layout
+from ..model.user import GearItem, UserState
 from .catalog import (
     AMPLIFIER_KEYS,
     DAMAGE_KEYS,
+    GOLD_KEYS,
+    SPEED_KEYS,
     INTRINSIC_KEYS,
     MODIFIER_KEYS,
     NON_DAMAGE_KEYS,
@@ -61,6 +64,17 @@ class Contribution:
     upgrade_id: int | None
     log10: float
     exact: bool = True
+    channel: str = "damage"
+
+
+@dataclass(frozen=True)
+class SpeedEffect:
+    source: str
+    hero_id: int
+    key: str
+    args: tuple[str, ...]
+    amount: float | None  # amplified amount (None when the key carries no amount)
+    stacks: float
 
 
 @dataclass
@@ -71,6 +85,9 @@ class ScoreResult:
     unmodelled_by_hero: dict[str, Counter] = field(default_factory=dict)
     modelled_exact: int = 0
     modelled_approx: int = 0
+    gold_log10: float = 0.0
+    speed: list[SpeedEffect] = field(default_factory=list)
+    damage_log10: float | None = None  # set when log10 is replaced by an objective value
 
     @property
     def coverage(self) -> float:
@@ -91,6 +108,22 @@ def _log_mult(pct: float) -> float:
     """log10 of a "+pct%" multiplier, guarded against nonsense values."""
     factor = 1.0 + pct / 100.0
     return math.log10(factor) if factor > 0 else 0.0
+
+
+_FACTOR_CAP = 1e250  # keep amplifier factors finite; anything near this is flagged as assumed anyway
+
+
+def _safe_pow(base: float, n: float) -> float:
+    if base <= 0:
+        return 0.0
+    exp = n * math.log10(base)
+    return 10.0 ** min(exp, 250.0)
+
+
+def _replace_amount(e: Effect, amount: float) -> Effect:
+    from dataclasses import replace
+
+    return replace(e, args=(f"{amount:.10g}", *e.args[1:]))
 
 
 def _self_only(e: Effect) -> bool:
@@ -147,18 +180,50 @@ class Scorer:
         self.feats: dict[int, tuple[int, ...]] = {}
         # user-asserted stack counts for runtime-stacked effects, by upgrade id
         self.stack_overrides: dict[int, float] = {}
+        self.gear: dict[int, list[GearItem]] = {}
+        # share of max_stacks assumed for runtime-stacked effects (1.0 = fully stacked)
+        self.stack_fraction: float = 1.0
         self._uid_cache: dict[int, frozenset[int]] = {}
         self._compiled_cache: dict[int, _Compiled] = {}
         self._patched_cache: dict[tuple, tuple[list[Effect], _Compiled]] = {}
 
     def effects_for(self, champ: Champion) -> list[Effect]:
         if champ.id not in self._effects:
-            self._effects[champ.id] = champ.effects(
+            effs = champ.effects(
                 level=self.levels.get(champ.id),
                 specs=self.specs.get(champ.id),
                 feat_ids=self.feats.get(champ.id, ()),
             )
+            self._effects[champ.id] = effs + self._gear_effects(champ)
         return self._effects[champ.id]
+
+    def _gear_effects(self, champ: Champion) -> list[Effect]:
+        out = []
+        for item in self.gear.get(champ.id, ()):
+            for e in self.data.loot.get((champ.id, item.slot_id, item.rarity), ()):
+                base = e.base_amount
+                if base is None or not e.args:
+                    out.append(e)
+                    continue
+                out.append(_replace_amount(e, base * item.multiplier))
+        return out
+
+    def apply_account(self, user: UserState) -> None:
+        """Use the account's specializations, feats and gear."""
+        self.feats = {h: f for h, f in user.feats.items() if f}
+        self.gear = {h: g for h, g in user.gear.items()}
+        self.specs = {}
+        for hid, chosen in user.spec_choices.items():
+            champ = self.data.champions.get(hid)
+            if champ is None or not chosen:
+                continue
+            picks = {}
+            for gi, group in enumerate(champ.spec_groups):
+                for u in group:
+                    if u.id in chosen:
+                        picks[gi] = u.id
+            self.specs[hid] = picks
+        self.invalidate()
 
     def invalidate(self, hero_id: int | None = None) -> None:
         if hero_id is None:
@@ -197,6 +262,18 @@ class Scorer:
                 result.modelled_exact += len(comp.self_only)  # buff only their owner
             for e in todo:
                 try:
+                    if e.key in GOLD_KEYS:
+                        value, exact = self._gold(e, src, src_slot, ctx, factor, flat)
+                        result.modelled_exact += exact
+                        result.modelled_approx += not exact
+                        if value:
+                            result.gold_log10 += value
+                            result.contributions.append(Contribution(src.name, e.key, e.upgrade_id, value, exact, "gold"))
+                        continue
+                    if e.key in SPEED_KEYS:
+                        result.speed.append(self._speed(e, src, src_slot, ctx, factor, flat))
+                        result.modelled_exact += 1
+                        continue
                     if e.key in INTRINSIC_KEYS:
                         self._check_intrinsic(e, src, src_slot, ctx)
                         continue
@@ -358,12 +435,24 @@ class Scorer:
             mult: dict[tuple[int, int | None], float] = {}
             new_flat: dict[tuple[int, int | None], float] = {}
             for e, keys, mode, n in terms:
-                a = self._scaled_amount(e, factor, flat) if e.upgrade_id in amplified_uids else e.base_amount
+                amplified = e.upgrade_id in amplified_uids
+                a = self._scaled_amount(e, factor, flat) if amplified else e.base_amount
+                if mode == "mult":
+                    # stacked factor of this amplifier; buffs to the amplifier itself
+                    # scale its stacked bonus ("post stack") unless it's a pre_stack upgrade
+                    if amplified and n != 1 and e.upgrade_id not in self.data.pre_stack_uids:
+                        k_all, k_idx = (e.upgrade_id, None), (e.upgrade_id, e.index)
+                        base = e.base_amount + flat.get(k_all, 0.0) + flat.get(k_idx, 0.0)
+                        f_own = factor.get(k_all, 1.0) * factor.get(k_idx, 1.0)
+                        stacked = _safe_pow(1.0 + base / 100.0, n)
+                        term = 1.0 + (stacked - 1.0) * f_own
+                    else:
+                        term = _safe_pow(1.0 + a / 100.0, n)
                 for k in keys:
                     if mode == "flat":
                         new_flat[k] = new_flat.get(k, 0.0) + a * n
                     elif mode == "mult":
-                        mult[k] = mult.get(k, 1.0) * (1.0 + a / 100.0) ** n
+                        mult[k] = min(mult.get(k, 1.0) * term, _FACTOR_CAP)
                     elif mode == "if":
                         add[k] = add.get(k, 0.0) + (a if n > 0 else 0.0)
                     elif mode == "if_not":
@@ -392,7 +481,7 @@ class Scorer:
         if e.upgrade_id is None:
             return base
         k_all, k_idx = (e.upgrade_id, None), (e.upgrade_id, e.index)
-        f = factor.get(k_all, 1.0) * factor.get(k_idx, 1.0)
+        f = min(factor.get(k_all, 1.0) * factor.get(k_idx, 1.0), _FACTOR_CAP)
         return (base + flat.get(k_all, 0.0) + flat.get(k_idx, 0.0)) * f
 
     def _amplifier_terms(self, e: Effect, src: Champion, src_slot: int, ctx: _Ctx):
@@ -506,6 +595,26 @@ class Scorer:
             if expr is None or match_tags(expr, ctx.placement[s].tags)
         )
 
+    def _gold(self, e: Effect, src: Champion, src_slot: int, ctx: _Ctx, factor, flat) -> tuple[float, bool]:
+        if e.key == "gold_multiplier_mult":
+            n, exact = self._stacks(e, src, src_slot, ctx)
+            return self._amplified(e, self._mode(e), n, factor, flat), exact
+        expr = e.args[1] if len(e.args) > 1 else ""
+        n = self._count(ctx, src, lambda c: match_tags(expr, c.tags), e.exclude_self)
+        mode = "mult" if e.key.endswith("_mult") else "add"
+        return self._amplified(e, mode, n, factor, flat), True
+
+    def _speed(self, e: Effect, src: Champion, src_slot: int, ctx: _Ctx, factor, flat) -> "SpeedEffect":
+        try:
+            amount = self._scaled_amount(e, factor, flat)
+        except _Unmodelled:
+            amount = None
+        try:
+            n, _ = self._stacks(e, src, src_slot, ctx)
+        except (_Unmodelled, UnsupportedExpr):
+            n = 1.0
+        return SpeedEffect(src.name, src.id, e.key, e.args, amount, n)
+
     @staticmethod
     def _mode(e: Effect) -> str:
         if e.amount_func in ("mult", "mult_with_self"):
@@ -540,7 +649,7 @@ class Scorer:
             if e.triggered:
                 if e.manually_stacked or e.max_stacks is None or e.max_stacks > MAX_ASSUMED_STACKS:
                     raise _Unmodelled
-                return e.max_stacks, False  # assume fully stacked
+                return e.max_stacks * self.stack_fraction, False  # assumed share of max stacks
             if sf is not None:
                 raise _Unmodelled
             return 1.0, not e.timed
@@ -649,6 +758,10 @@ def static_class(e: Effect, layout: Layout) -> str:
     key = e.key
     if key in PARAM_KEYS:
         return "param"
+    if key in GOLD_KEYS:
+        return "gold"
+    if key in SPEED_KEYS:
+        return "speed"
     if key in NON_DAMAGE_KEYS:
         return "non_damage"
     if key in INTRINSIC_KEYS:

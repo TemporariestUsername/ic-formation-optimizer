@@ -10,3 +10,7 @@ dist/
 .icfo-cache/
 credentials.json
 .env
+
+# Account-specific outputs
+sweep*.csv
+sweep*.json

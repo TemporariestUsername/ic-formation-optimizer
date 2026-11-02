@@ -14,6 +14,9 @@ Every effect on a placed champion falls in exactly one class:
               formation, so it can't change which formation is best (for a
               fixed carry). Ignored, but only when it really targets just the
               source and has no formation-dependent stack count.
+* GOLD        gold find; scored into a separate "gold" channel
+* SPEED       progress speed (spawns, quests, time scale, Briv); collected for
+              the gem-farm model
 * anything else is UNMODELLED and reported.
 """
 
@@ -70,14 +73,11 @@ NON_DAMAGE_KEYS = frozenset({
     "grant_temporary_hp_with_cooldown",
     "damage_reduction",
     "appear_dead",
-    "gold_multiplier_mult",
-    "gold_mult_per_tagged_crusader_mult",
     "scavenge_items",
     "add_hero_tags",
     "force_allow_hero",
     "animation_synced_overlay",
     "disallow_roaming_familiar_ult_trigger",
-    "increase_monster_spawn_time_mult",
     "mirror_image_preference",
     "add_attack_stun",
     "monster_speed_reduce",
@@ -116,3 +116,30 @@ COUNTED_STACK_FUNCS = frozenset({
 
 # how a stack count combines with the amount
 SUPPORTED_AMOUNT_FUNCS = frozenset({None, "mult", "add", "if", "if_not", "mult_with_self"})
+
+# Gold find: scored into the "gold" channel (formation-wide, not carry-targeted)
+GOLD_KEYS = frozenset({
+    "gold_multiplier_mult",
+    "gold_mult_per_tagged_crusader_mult",
+    "gold_mult_per_tagged_crusader",
+})
+
+# Progress speed: collected into the "speed" channel for the gem-farm model
+SPEED_KEYS = frozenset({
+    "increase_monster_spawn_time_mult",
+    "decrease_monster_spawn_time_mult",
+    "decrease_monster_spawn_delay_mult",
+    "spawn_additional_monsters",
+    "simultaneous_monster_spawn_chance_mult",
+    "simultaneous_monster_spawn_chance_add",
+    "chance_reduce_quest_requirement",
+    "reduce_quest_requirements_free_play",
+    "chance_multiply_monster_quest_rewards",
+    "chance_multiply_monster_quest_rewards_new",
+    "killing_blow_quest_mult",
+    "time_scale",
+    "time_scale_when_not_attacked",
+    "area_transition_time_scale",
+    "briv_unnatural_haste",
+    "briv_unnatural_haste_stack_consume_percent_override",
+})

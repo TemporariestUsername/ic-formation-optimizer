@@ -28,6 +28,13 @@ class LayoutNotFound(KeyError):
     """Adventure has no formation layout (e.g. special modes whose campaign isn't defined)."""
 
 
+def _float(v: Any, default: float = 0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _int(v: Any, default: int = 0) -> int:
     try:
         return int(v)
@@ -67,6 +74,8 @@ class Champion:
     tags: frozenset[str]
     stats: dict[str, int] = field(default_factory=dict)  # ability scores: str, dex, ...
     species: str | None = None  # race tag, e.g. "dwarf", "half-orc" (for per-unique-species effects)
+    base_damage: float = 1.0
+    base_attack_id: int = 0
     upgrades: list[Upgrade] = field(default_factory=list)
     feats: list[Feat] = field(default_factory=list)
 
@@ -148,6 +157,8 @@ class GameData:
                 tags=frozenset(str(t) for t in h.get("tags") or []),
                 stats={str(k).lower(): _int(v) for k, v in (scores or {}).items()},
                 species=_species(sheet.get("race") if isinstance(sheet, dict) else None, h.get("tags") or []),
+                base_damage=_float(h.get("base_damage"), 1.0),
+                base_attack_id=_int(h.get("base_attack_id")),
             )
         self.upgrades: dict[int, Upgrade] = {}
         for u in defs.get("upgrade_defines") or []:
@@ -188,6 +199,14 @@ class GameData:
             u.id for u in self.upgrades.values()
             if any(e.key in ("pre_stack", "pre_stack_amount") for e in u.effects)
         )
+        # gear: (hero, slot, rarity) -> effects listed for that item
+        self.loot: dict[tuple[int, int, int], list[Effect]] = {}
+        for item in defs.get("loot_defines") or []:
+            hid = _int(item.get("hero_id"))
+            if hid in self.champions:
+                key = (hid, _int(item.get("slot_id")), _int(item.get("rarity")))
+                self.loot[key] = normalize(item.get("effects"), self.effect_defines, hero_id=hid)
+        self.attacks: dict[int, dict] = {_int(a.get("id")): a for a in defs.get("attack_defines") or []}
         self.campaigns: dict[int, dict] = {
             _int(c.get("id")): c for c in defs.get("campaign_defines") or []
         }

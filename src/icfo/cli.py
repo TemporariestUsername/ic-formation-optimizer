@@ -4,7 +4,11 @@
     icfo fetch-user                       # needs IC_USER_ID / IC_HASH env vars
     icfo adventures --search "chicken"    # find adventure / variant ids
     icfo layout 4                         # show layout + parsed variant rules
-    icfo optimize 4 --carry Nrakk         # best formation for a carry
+    icfo optimize 4                       # best push formation, carry chosen automatically
+    icfo optimize 4 --mode favor          # ... for favor farming
+    icfo optimize 4 --mode gems --reset-area 900
+    icfo sweep --modes push,favor,gems    # every adventure and variant -> sweep.csv
+    icfo calibrate                        # how damage is anchored to your progress
     icfo coverage                         # which effect types are still unmodelled
     icfo stacks Walnut Krux               # runtime-stacked effects you can set with --stacks
 """
@@ -20,7 +24,10 @@ from pathlib import Path
 from .engine.score import Scorer, static_class
 from .fetch import Cache, Credentials, IdleChampionsClient
 from .model import GameData, UserState, constraints_for
+from .objectives import GemParams, ObjectiveScorer, calibrate
 from .optimize import Infeasible, anneal, candidate_pool, greedy
+from .optimize.planner import plan
+from .optimize.sweep import make_objective, run_sweep
 
 def _load_defs(args) -> GameData:
     if args.defs:
@@ -121,54 +128,154 @@ def cmd_layout(args) -> None:
         print("warning:", w)
 
 
+def _scorer_factory(data: GameData, user: UserState, args):
+    stacks = _load_stacks(args.stacks, data) if getattr(args, "stacks", None) else {}
+
+    def make(layout):
+        scorer = Scorer(data, layout)
+        if user.from_account:
+            scorer.apply_account(user)
+        scorer.stack_overrides = dict(stacks)
+        scorer.stack_fraction = args.stack_assumption
+        return scorer
+
+    return make
+
+
+def _gem_params(args, user: UserState, adventure_id: int | None = None) -> GemParams:
+    reset = args.reset_area
+    if reset is None and adventure_id is not None:
+        reset = next((i.reset_area for i in user.instances if i.adventure_id == adventure_id and i.reset_area), None)
+    return GemParams(
+        reset_area=reset or 1000,
+        kills_per_area=args.kills_per_area,
+        spawn_interval_s=args.spawn_interval,
+        transition_s=args.transition_time,
+        briv_stacks=args.briv_stacks,
+    )
+
+
+def _calibration(args, data, user, make):
+    if getattr(args, "no_calibration", False) or not user.from_account:
+        return None
+    return calibrate(data, user, make)
+
+
+def cmd_calibrate(args) -> None:
+    data = _load_defs(args)
+    user = _load_user(args, data)
+    cal = _calibration(args, data, user, _scorer_factory(data, user, args))
+    if cal is None:
+        sys.exit("No calibration: needs account data with an instance past area 10.")
+    adv = data.adventures[cal.adventure_id]
+    print(f"anchored to {adv.name} (id {cal.adventure_id}) at area {cal.area}, carry {cal.carry}")
+    print(f"offset: true log10 DPS ≈ model + {cal.offset:.2f}   ({cal.note})")
+
+
 def cmd_optimize(args) -> None:
     data = _load_defs(args)
     user = _load_user(args, data)
     constraints = constraints_for(data, args.adventure)
-    carry = data.champion(args.carry)
-    if carry.id not in user.owned:
-        sys.exit(f"{carry.name} is not owned on this account.")
-    if not constraints.allows(carry):
-        sys.exit(f"{carry.name} is not allowed in this adventure.")
+    carry = None
+    if args.carry and args.carry != "auto":
+        carry = data.champion(args.carry)
+        if carry.id not in user.owned:
+            sys.exit(f"{carry.name} is not owned on this account.")
+        if not constraints.allows(carry):
+            sys.exit(f"{carry.name} is not allowed in this adventure.")
     pool = candidate_pool(list(data.champions.values()), constraints, user.owned)
-    scorer = Scorer(data, constraints.layout)
-    if args.stacks:
-        scorer.stack_overrides = _load_stacks(args.stacks, data)
+    make = _scorer_factory(data, user, args)
+    cal = _calibration(args, data, user, make)
+    objective = make_objective(args.mode, data, user, cal, _gem_params(args, user, args.adventure))
+    oscorer = ObjectiveScorer(make(constraints.layout), objective)
 
     try:
-        if args.solver == "greedy":
-            result = greedy(scorer, constraints, pool, carry)
-        elif args.solver == "cpsat":
-            from .optimize.cpsat import solve
-            result = solve(scorer, constraints, pool, carry)
+        if args.solver == "planner":
+            p = plan(oscorer, constraints, pool, carry, args.profile, seed=args.seed)
+            carry, placement, sc, evals, tried = p.carry, p.placement, p.result, p.evaluations, p.carries_tried
         else:
-            result = anneal(scorer, constraints, pool, carry, iterations=args.iterations, seed=args.seed)
+            if carry is None:
+                sys.exit("--solver greedy/anneal/cpsat need --carry; use the default planner for auto carry")
+            if args.solver == "greedy":
+                r = greedy(oscorer, constraints, pool, carry)
+            elif args.solver == "cpsat":
+                from .optimize.cpsat import solve
+                r = solve(oscorer, constraints, pool, carry)
+            else:
+                r = anneal(oscorer, constraints, pool, carry, iterations=args.iterations, seed=args.seed)
+            placement, sc, evals, tried = r.placement, r.score, r.evaluations, [carry.name]
     except Infeasible as exc:
         sys.exit(f"infeasible: {exc}")
 
+    adv = data.adventures[args.adventure]
     labels = {i: "XX" for i in constraints.blocked_slots}
-    labels.update({s: c.name for s, c in result.placement.items()})
+    labels.update({s: c.name for s, c in placement.items()})
+    print(f"{adv.name} (id {adv.id}) - mode: {args.mode}, carry: {carry.name}"
+          + (f"  (auto, compared: {', '.join(tried)})" if len(tried) > 1 else ""))
+    print(f"account: {'yours (specs, feats, gear applied)' if user.from_account else 'theory (owns everything, default specs)'}\n")
     print(constraints.layout.render(labels, width=12))
-    sc = result.score
-    print(f"\nformation multiplier on {carry.name}: x10^{sc.log10:.2f}   ({result.evaluations} evaluations)")
+    print()
+    for k, v in objective.summary(sc, carry, placement).items():
+        print(f"  {k:<18} {v}")
+    dmg = sc.damage_log10 if sc.damage_log10 is not None else sc.log10
+    print(f"\nformation damage multiplier on {carry.name}: x10^{dmg:.2f}; gold find x10^{sc.gold_log10:.2f}   ({evals} evaluations)")
     print(f"effect coverage {sc.coverage:.0%} of {sc.modelled_exact + sc.modelled_approx + sum(sc.unmodelled.values())} "
           f"relevant effects; {sc.approx_share:.0%} of the score assumes max stacks / full uptime")
+    if cal is not None:
+        print(f"area estimates calibrated on {data.adventures[cal.adventure_id].name} @ {cal.area} ({cal.note})")
     by_source: Counter = Counter()
     approx_by_source: Counter = Counter()
-    for contrib in result.score.contributions:
+    gold_by_source: Counter = Counter()
+    for contrib in sc.contributions:
+        if contrib.channel == "gold":
+            gold_by_source[contrib.source] += contrib.log10
+            continue
         by_source[contrib.source] += contrib.log10
         if not contrib.exact:
             approx_by_source[contrib.source] += contrib.log10
-    print("\ncontributions (log10):")
+    print("\ndamage contributions (log10):")
     for name, val in by_source.most_common():
         note = f"   ({approx_by_source[name]:+.2f} assumed)" if approx_by_source[name] else ""
         print(f"  {name:<20} {val:+8.2f}{note}")
-    if result.score.unmodelled_by_hero:
+    if gold_by_source and args.mode != "push":
+        print("gold find contributions (log10):")
+        for name, val in gold_by_source.most_common():
+            print(f"  {name:<20} {val:+8.2f}")
+    if sc.speed and args.mode == "gems":
+        print("speed effects used:")
+        for e in sc.speed:
+            print(f"  {e.source:<20} {e.key} {'' if e.amount is None else f'{e.amount:g}'}")
+    if sc.unmodelled_by_hero:
         print("\nunmodelled effects (result may under/over-rate these champions):")
-        for name, keys in sorted(result.score.unmodelled_by_hero.items()):
+        for name, keys in sorted(sc.unmodelled_by_hero.items()):
             print(f"  {name:<20} " + ", ".join(f"{k}×{n}" for k, n in keys.most_common(4)))
     for w in constraints.warnings:
         print("warning:", w)
+
+
+def cmd_sweep(args) -> None:
+    data = _load_defs(args)
+    user = _load_user(args, data)
+    make = _scorer_factory(data, user, args)
+    cal = _calibration(args, data, user, make)
+    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+    ids = [int(x) for x in args.adventures.split(",")] if args.adventures else None
+    if args.limit and ids is None:
+        ids = sorted(data.adventures)[: args.limit]
+
+    def progress(done, total):
+        if done == total or done % max(1, total // 20) == 0:
+            print(f"  {done}/{total} solved", flush=True)
+
+    summary = run_sweep(
+        data, user, modes, calibration=cal, out_csv=args.out, out_json=args.json,
+        profile=args.profile, workers=args.workers, adventure_ids=ids,
+        use_account=user.from_account, gem_params=_gem_params(args, user), progress=progress,
+        stack_fraction=args.stack_assumption,
+        stack_overrides=_load_stacks(args.stacks, data) if args.stacks else None,
+    )
+    print(json.dumps(summary, indent=2))
+    print(f"wrote {args.out}" + (f" and {args.json}" if args.json else ""))
 
 
 def cmd_coverage(args) -> None:
@@ -189,6 +296,7 @@ def cmd_coverage(args) -> None:
     groups = [
         ("scored exactly", ("damage", "amplifier", "modifier")),
         ("scored, assumes max stacks/uptime", ("approx",)),
+        ("gold find / speed (used by favor and gem modes)", ("gold", "speed")),
         ("safely ignored (bookkeeping, non-damage, self-only)", ("param", "non_damage", "intrinsic")),
         ("unmodelled", ("unmodelled",)),
     ]
@@ -221,16 +329,48 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("adventure", type=int)
     s.set_defaults(func=cmd_layout)
 
-    s = sub.add_parser("optimize")
+    def account_args(sp):
+        sp.add_argument("--user", help="getuserdetails JSON file (default: cached fetch-user data)")
+        sp.add_argument("--all-champions", action="store_true",
+                        help="theory-craft: own every champion, default specs, no gear")
+        sp.add_argument("--stacks", help='JSON stack assumptions, e.g. {"Walnut:Pen-Paws": 20, "11654": 60}')
+        sp.add_argument("--no-calibration", action="store_true", help="don't anchor damage to your progress")
+        sp.add_argument("--stack-assumption", type=float, default=1.0,
+                        help="share of max stacks assumed for kill/attack/timer stacks (1 = full, 0 = ignore)")
+
+    def mode_args(sp):
+        sp.add_argument("--profile", choices=["fast", "thorough"], default="thorough" if sp.prog.endswith("optimize") else "fast")
+        sp.add_argument("--reset-area", type=int, help="gems: Modron reset area (default: your Modron setting or 1000)")
+        sp.add_argument("--kills-per-area", type=float, default=25.0)
+        sp.add_argument("--spawn-interval", type=float, default=1.0, help="gems: seconds between spawns at base speed")
+        sp.add_argument("--transition-time", type=float, default=4.0, help="gems: seconds per area transition")
+        sp.add_argument("--briv-stacks", type=float, help="gems: Sprint stacks per run (default: your current stacks)")
+
+    s = sub.add_parser("optimize", help="best formation for one adventure")
     s.add_argument("adventure", type=int)
-    s.add_argument("--carry", required=True, help="champion name or id")
-    s.add_argument("--solver", choices=["anneal", "greedy", "cpsat"], default="anneal")
+    s.add_argument("--mode", choices=["push", "favor", "gems"], default="push")
+    s.add_argument("--carry", default="auto", help="champion name/id, or auto (default)")
+    s.add_argument("--solver", choices=["planner", "anneal", "greedy", "cpsat"], default="planner")
     s.add_argument("--iterations", type=int, default=20000)
     s.add_argument("--seed", type=int, default=0)
-    s.add_argument("--user", help="getuserdetails JSON file")
-    s.add_argument("--all-champions", action="store_true", help="pretend every champion is owned")
-    s.add_argument("--stacks", help='JSON stack assumptions, e.g. {"Walnut:Pen-Paws": 20, "11654": 60}')
+    account_args(s)
+    mode_args(s)
     s.set_defaults(func=cmd_optimize)
+
+    s = sub.add_parser("sweep", help="optimise every adventure/variant")
+    s.add_argument("--modes", default="push,favor,gems")
+    s.add_argument("--out", default="sweep.csv")
+    s.add_argument("--json")
+    s.add_argument("--workers", type=int, default=4)
+    s.add_argument("--adventures", help="comma-separated ids (default: all)")
+    s.add_argument("--limit", type=int, help="only the first N adventures (for a quick look)")
+    account_args(s)
+    mode_args(s)
+    s.set_defaults(func=cmd_sweep)
+
+    s = sub.add_parser("calibrate", help="show how model damage is anchored to your progress")
+    account_args(s)
+    s.set_defaults(func=cmd_calibrate)
 
     s = sub.add_parser("stacks", help="list runtime-stacked effects (for --stacks)")
     s.add_argument("champions", nargs="+")
