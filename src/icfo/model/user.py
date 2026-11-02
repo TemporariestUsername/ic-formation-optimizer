@@ -60,6 +60,8 @@ class GameInstance:
     highest_area: int
     formation: tuple[int, ...]  # hero id per slot, -1 empty
     reset_area: int | None = None  # Modron auto-reset area for this instance
+    patron_id: int | None = None
+    seconds_since_reset: int = 0
 
 
 @dataclass
@@ -127,6 +129,8 @@ class UserState:
                 highest_area=_int(gi.get("highest_area")),
                 formation=tuple(_int(x, -1) for x in gi.get("formation") or []),
                 reset_area=reset_by_instance.get(iid),
+                patron_id=_int(gi.get("current_patron_id")) or None,
+                seconds_since_reset=_int(gi.get("seconds_since_reset")),
             ))
         adv = details.get("adventure_data") or {}
         return cls(

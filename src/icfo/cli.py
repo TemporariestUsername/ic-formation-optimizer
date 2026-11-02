@@ -9,6 +9,7 @@
     icfo optimize 4 --mode gems --reset-area 900
     icfo sweep --modes push,favor,gems    # every adventure and variant -> sweep.csv
     icfo calibrate                        # how damage is anchored to your progress
+    icfo track [--stalled]                # record progress; compare model vs reality
     icfo coverage                         # which effect types are still unmodelled
     icfo stacks Walnut Krux               # runtime-stacked effects you can set with --stacks
 """
@@ -25,7 +26,7 @@ from .engine.score import Scorer, static_class
 from .fetch import Cache, Credentials, IdleChampionsClient
 from .model import GameData, UserState, constraints_for
 from .model.bonuses import PATRONS, Bonuses, patron_id
-from .objectives import GemParams, ObjectiveScorer, calibrate
+from .objectives import GemParams, ObjectiveScorer, Progression, calibrate
 from .optimize import Infeasible, anneal, candidate_pool, greedy
 from .optimize.planner import TIER_LABELS, plan_tiers
 from .optimize.sweep import make_objective, run_sweep
@@ -181,7 +182,50 @@ def _gem_params(args, user: UserState, adventure_id: int | None = None) -> GemPa
 def _calibration(args, data, user, make):
     if getattr(args, "no_calibration", False) or not user.from_account:
         return None
-    return calibrate(data, user, make)
+    from .track import load as load_observations
+    return calibrate(data, user, make, load_observations(Cache(args.cache)))
+
+
+def cmd_track(args) -> None:
+    from . import track
+
+    data = _load_defs(args)
+    cache = Cache(args.cache)
+    if args.no_fetch:
+        user = _load_user(args, data)
+    else:
+        client = IdleChampionsClient(cache)
+        creds = Credentials.from_env()
+        user = UserState.from_details(client.user_details(creds, max_age_s=0))
+        client.campaign_details(creds)
+    if not user.from_account:
+        sys.exit("track needs account data")
+    observations, changed = track.record(cache, user, stalled=args.stalled)
+    print(f"{len(changed)} observation(s) added/updated; {len(observations)} stored"
+          + (" (current runs marked as at their wall)" if args.stalled else ""))
+    if not observations:
+        return
+    make = _scorer_factory(data, user, args)
+    ev = track.evaluate(data, observations, make)
+    offset, how = track.offset_from(ev)
+    prog = Progression(data)
+    print(f"calibration: true log10 DPS ≈ model + {offset:.2f}  ({how})\n")
+    print(f"  {'adventure':<30} {'patron':<9} {'carry':<15} {'observed':>8} {'predicted':>9} {'error':>7}  kind")
+    for e in sorted(ev, key=lambda e: -e.obs.highest_area):
+        pred = prog.area_for(e.model + offset)
+        adv = data.adventures[e.obs.adventure_id].name[:30]
+        patron = PATRONS.get(e.obs.patron_id, "-") if e.obs.patron_id else "-"
+        kind = "wall" if e.obs.stalled else "lower bound"
+        print(f"  {adv:<30} {patron:<9} {e.carry:<15} {e.obs.highest_area:>8} {pred:>9.0f} {pred - e.obs.highest_area:>+7.0f}  {kind}")
+    slope = prog.slope(1000)
+    spread = track.consistency(ev, slope)
+    if spread is None:
+        print("\nconsistency: needs 2+ wall observations (run `icfo track --stalled` when runs stall)")
+    else:
+        print(f"\nconsistency: wall observations disagree by ±{spread:.0f} areas (smaller = model ranks formations better)")
+        print("stack assumption fit (spread in areas, lower is better):")
+        for f, sp in track.fit_stack_fraction(data, observations, make):
+            print(f"  {f:>4.0%} of max stacks: ±{sp:.0f}" if sp is not None else f"  {f:>4.0%}: n/a")
 
 
 def cmd_calibrate(args) -> None:
@@ -455,6 +499,12 @@ def main(argv: list[str] | None = None) -> None:
     account_args(s)
     mode_args(s)
     s.set_defaults(func=cmd_sweep)
+
+    s = sub.add_parser("track", help="record your instances' progress and check the model against it")
+    s.add_argument("--stalled", action="store_true", help="your current runs are at their wall (exact points)")
+    s.add_argument("--no-fetch", action="store_true", help="use cached account data instead of fetching")
+    account_args(s)
+    s.set_defaults(func=cmd_track)
 
     s = sub.add_parser("calibrate", help="show how model damage is anchored to your progress")
     account_args(s)

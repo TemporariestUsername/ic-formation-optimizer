@@ -209,6 +209,21 @@ ICFO_DEFS=.icfo-cache/definitions.json pytest # + smoke test over every live adv
 - Specializations default to the first option in each choice group, and all upgrades
   are treated as unlocked (max level) unless levels are supplied.
 
+## Checking the model against your game
+
+```bash
+icfo track            # after playing: records each instance's formation, patron and highest area
+icfo track --stalled  # when your runs have hit their wall: exact calibration points
+```
+
+Each observation compares the model's damage for that exact formation with the area
+actually reached. Lower-bound observations (runs still going) tighten the calibration.
+Wall observations also test the model itself: if it ranked formations correctly, every
+wall would need the same calibration offset. `track` reports how far they disagree, in
+areas, and refits with 0–100% of max stacks to show which stack assumption your results
+support. `calibrate` and all area estimates use every observation recorded (median of
+walls, otherwise the tightest lower bound). Observations live in the local cache only.
+
 ## Account data
 
 `icfo fetch-user` reads `IC_USER_ID` / `IC_HASH` and calls only read endpoints. The hash

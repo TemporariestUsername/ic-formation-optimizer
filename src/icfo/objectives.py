@@ -105,8 +105,21 @@ class Calibration:
     note: str = "lower bound: anchored to the instance's highest area, which may be below its wall"
 
 
-def calibrate(data: GameData, user: UserState, scorer_for) -> Calibration | None:
-    """Anchor model damage to the account's furthest-progressed instance."""
+def calibrate(data: GameData, user: UserState, scorer_for, observations=None) -> Calibration | None:
+    """Anchor model damage to reality.
+
+    With tracked observations (``icfo track``): the median offset of wall
+    observations, or the tightest lower bound. Otherwise: the account's
+    furthest-progressed instance (a lower bound).
+    """
+    if observations:
+        from .track import evaluate, offset_from
+        ev = evaluate(data, observations, scorer_for)
+        offset, how = offset_from(ev)
+        if offset is not None:
+            anchor = max(ev, key=lambda e: e.obs.highest_area)
+            return Calibration(offset, anchor.obs.adventure_id, anchor.obs.highest_area, anchor.carry,
+                               note=f"{how} (icfo track)")
     prog = Progression(data)
     best: Calibration | None = None
     for inst in user.instances:
