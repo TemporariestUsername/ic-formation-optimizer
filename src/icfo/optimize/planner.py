@@ -155,6 +155,46 @@ def prune_pool(scorer, constraints: Constraints, pool: list[Champion], carry: Ch
     return list(kept.values())
 
 
+def improve_swaps(scorer, constraints: Constraints, pool: list[Champion], placement: dict[int, Champion],
+                  carry: Champion, rounds: int = 3) -> dict[int, Champion]:
+    """Best-improvement local search over single swaps: put any unused pool
+    champion into any open slot (replacing its occupant, never the carry), or
+    swap two placed champions. Annealing finds these only by chance."""
+    placement = dict(placement)
+    best = scorer.score(placement, carry.id).log10
+    locked = {carry.id} | constraints.required_ids
+    for _ in range(rounds):
+        move = None
+        used = {c.id for c in placement.values()}
+        for slot in constraints.open_slots:
+            occupant = placement.get(slot)
+            if occupant is not None and occupant.id in locked:
+                continue
+            seats = {c.seat for s, c in placement.items() if s != slot}
+            for cand in pool:
+                if cand.id in used or cand.seat in seats:
+                    continue
+                trial = {**placement, slot: cand}
+                if not constraints.placement_ok(trial):
+                    continue
+                v = scorer.score(trial, carry.id).log10
+                if v > best + 1e-9:
+                    best, move = v, trial
+        slots = list(placement)
+        for i, a in enumerate(slots):  # position swaps between placed champions
+            for b in slots[i + 1:]:
+                trial = dict(placement)
+                trial[a], trial[b] = placement[b], placement[a]
+                if constraints.placement_ok(trial):
+                    v = scorer.score(trial, carry.id).log10
+                    if v > best + 1e-9:
+                        best, move = v, trial
+        if move is None:
+            break
+        placement = move
+    return placement
+
+
 def _constructive_start(scorer, constraints, pool, carry) -> dict[int, Champion]:
     """Seed + fill free slots in order of marginal gain (cheap, never infeasible)."""
     k = _anchor_slot(constraints, carry)
@@ -239,8 +279,10 @@ def plan(scorer, constraints: Constraints, pool: list[Champion], carry: Champion
                     cand = pol
             if cand.score.log10 > best_res.score.log10:
                 best_res, best_carry = cand, c
-    final, specs, changes = optimize_specs(scorer, best_res.placement, best_carry)
-    return Plan(best_carry, best_res.placement, final, evals, [c.name for c in shortlist], specs, changes)
+    best_sub = next(sub for res, c, sub in results if c.id == best_carry.id)
+    placement = improve_swaps(scorer, constraints, best_sub, best_res.placement, best_carry)
+    final, specs, changes = optimize_specs(scorer, placement, best_carry)
+    return Plan(best_carry, placement, final, evals, [c.name for c in shortlist], specs, changes)
 
 
 # -- feats and acquisition tiers -------------------------------------------------
@@ -378,6 +420,7 @@ def plan_tiers(scorer, constraints: Constraints, pool: list[Champion], user, car
                        t_start=0.1, seed=seed + 7)
         if again.score.log10 > res.log10 + 1e-9:
             placement = again.placement
+        placement = improve_swaps(scorer, constraints, sub, placement, c)
         res, specs, changes = optimize_specs(scorer, placement, c)
         res, feats = optimize_feats(scorer, placement, c, user, tier)
         if prev is not None and res.log10 < prev.result.log10:
