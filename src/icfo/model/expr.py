@@ -50,7 +50,7 @@ def _translate(expr: str) -> str:
 @lru_cache(maxsize=8192)
 def compile_expr(expr: str) -> ast.Expression:
     try:
-        return ast.parse(_translate(expr.strip()), mode="eval")
+        return ast.parse(_translate(expr.strip()).strip(), mode="eval")
     except SyntaxError as exc:
         raise UnsupportedExpr(f"cannot parse {expr!r}") from exc
 
@@ -150,6 +150,8 @@ def champion_names(champ: "Champion", params: Mapping[str, Any] | None = None) -
             return sum(champ.stats.get(s, 0) for s in STATS)
         if name.startswith("has_tag_"):
             return name[len("has_tag_"):] in champ.tags
+        if name.startswith("has_base_attack_dmg_type_"):
+            return name[len("has_base_attack_dmg_type_"):] in champ.attack_types
         if params is not None and name in params and isinstance(params[name], (int, float)):
             return params[name]
         raise KeyError(name)
@@ -162,6 +164,8 @@ def champion_funcs(champ: "Champion") -> dict[str, Callable[..., Any]]:
         **BASE_FUNCS,
         "HasTag": lambda tag: tag in champ.tags,
         "GetStat": lambda stat: champ.stats.get(str(stat).lower(), 0),
+        "GetBaseStat": lambda stat: champ.stats.get(str(stat).lower(), 0),
+        "HasAttackDamageType": lambda t: str(t) in champ.attack_types,
     }
 
 

@@ -176,3 +176,19 @@ def test_escort_stage_follows_objective_area(data):
     data.adventures[2].game_changes = [{"type": "slot_escort_by_area", "escorts": [
         {"min_area": 1, "slot_ids": [3]}, {"min_area": 51, "slot_ids": [3, 2]}, {"min_area": 101, "slot_ids": [3, 2, 1, 0]}]}]
     assert constraints_for(data, 2).blocked_slots == {2, 3}
+
+
+def test_parenthesised_tags_and_slot_scoped_rules(data):
+    assert match_tags("(chaotic^good)|(neutral^good)", {"neutral", "good"})
+    assert not match_tags("(chaotic^good)|(neutral^good)", {"chaotic", "evil"})
+    assert match_tags("!(evil|chaotic)", {"lawful", "good"})
+    # "top of each column must be X, bottom must be Y"
+    data.adventures[2].game_changes = [
+        {"type": "only_allow_crusaders", "by_expr": {"expr": "HasTag(`human`)", "target_slots": {"type": "slots", "data": [0, 1]}}},
+        {"type": "only_allow_crusaders", "by_expr": {"expr": "!HasTag(`human`)", "target_slots": {"type": "slots", "data": [2, 3]}}},
+    ]
+    c = constraints_for(data, 2)
+    ch = data.champions
+    assert all(c.allows(x) for x in ch.values())  # no global restriction
+    assert c.placement_ok({0: ch[1], 1: ch[4], 2: ch[2]})  # humans top, elf bottom
+    assert not c.placement_ok({2: ch[1]})  # human in a bottom slot

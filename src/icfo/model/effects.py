@@ -192,13 +192,19 @@ def _normalize_into(out, value, effect_defines, hero_id, upgrade_id, feat_id, de
         out.append(Effect(key=key, args=tuple(args), raw=entry, hero_id=hero_id, upgrade_id=upgrade_id, feat_id=feat_id))
 
 
-def match_tags(expr: str, tags: Iterable[str]) -> bool:
-    """Evaluate a tag expression such as ``dwarf``, ``!human`` or ``druid|ranger``.
+_TAG_TOKEN = re.compile(r"[A-Za-z0-9_\-']+")
 
-    ``|`` is OR; ``&`` and ``^`` are AND (bind tighter); a leading ``!`` negates
-    a term. Compound terms that aren't tags themselves (``lawful_good``) mean all
-    of their parts (``lawful`` AND ``good``).
+
+def match_tags(expr: str, tags: Iterable[str]) -> bool:
+    """Evaluate a tag expression such as ``dwarf``, ``!human``, ``druid|ranger`` or
+    ``(chaotic^good)|(neutral^good)``.
+
+    ``|`` is OR; ``&`` and ``^`` are AND (bind tighter); ``!`` negates; parentheses
+    group. Compound terms that aren't tags themselves (``lawful_good``) mean all of
+    their parts (``lawful`` AND ``good``).
     """
+    from .expr import UnsupportedExpr, evaluate_with
+
     tagset = set(tags)
 
     def has(name: str) -> bool:
@@ -207,16 +213,21 @@ def match_tags(expr: str, tags: Iterable[str]) -> bool:
         parts = name.split("_")
         return len(parts) > 1 and all(p in tagset for p in parts)
 
-    for alt in str(expr).split("|"):
-        ok = True
-        for term in re.split(r"[&^]", alt):
-            term = term.strip()
-            if not term:
-                continue
-            neg = term.startswith("!")
-            if has(term.lstrip("!")) == neg:
-                ok = False
-                break
-        if ok:
-            return True
-    return False
+    text = str(expr).strip()
+    if not text:
+        return True
+    names: list[str] = []
+
+    def tok(m: re.Match) -> str:
+        names.append(m.group(0))
+        return f" T{len(names) - 1} "
+
+    py = _TAG_TOKEN.sub(tok, text).replace("^", "&")
+    try:
+        return bool(evaluate_with(
+            py.replace("&", " and ").replace("|", " or ").replace("!", " not "),
+            lambda n: has(names[int(n[1:])]) if n.startswith("T") and n[1:].isdigit() else (_ for _ in ()).throw(KeyError(n)),
+            {},
+        ))
+    except UnsupportedExpr:
+        return False

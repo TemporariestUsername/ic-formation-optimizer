@@ -50,6 +50,7 @@ _OPS = {"<": operator.lt, "<=": operator.le, ">": operator.gt, ">=": operator.ge
 class Rule:
     description: str
     test: Callable[[Champion], bool]
+    slots: frozenset[int] | None = None  # only applies to these slots ("target_slots")
 
     def __call__(self, champ: Champion) -> bool:
         return self.test(champ)
@@ -73,7 +74,20 @@ class Constraints:
     def allows(self, champ: Champion) -> bool:
         if champ.id in self.required_ids:
             return True
-        return all(r(champ) for r in self.allow_rules) and not any(r(champ) for r in self.ban_rules)
+        return (all(r(champ) for r in self.allow_rules if r.slots is None)
+                and not any(r(champ) for r in self.ban_rules if r.slots is None))
+
+    def allows_in(self, champ: Champion, slot: int) -> bool:
+        """Slot-scoped rules ("champions in the top of each column must be...")."""
+        if champ.id in self.required_ids:
+            return True
+        for r in self.allow_rules:
+            if r.slots is not None and slot in r.slots and not r(champ):
+                return False
+        for r in self.ban_rules:
+            if r.slots is not None and slot in r.slots and r(champ):
+                return False
+        return True
 
     def placement_ok(self, placement: dict[int, Champion]) -> bool:
         """Check a full ``slot -> champion`` placement against every constraint."""
@@ -83,7 +97,7 @@ class Constraints:
                 return False
             # a key champion in its forced slot is exempt from the allow rules (as in game)
             forced = slot in self.forced_slot_rules and self.forced_slot_rules[slot](champ)
-            if not forced and not self.allows(champ):
+            if not forced and not (self.allows(champ) and self.allows_in(champ, slot)):
                 return False
             if champ.seat in seats:
                 return False
@@ -141,9 +155,17 @@ def _entry_rule(gc: dict, kind: str, c: Constraints, champs: list[Champion]) -> 
     rules = _probe(_rules_for(gc, kind, c), champs, c)
     if not rules:
         return None
+    slots: set[int] = set()
+    for key, value in gc.items():
+        ts = value.get("target_slots") if isinstance(value, dict) else None
+        if isinstance(ts, dict) and ts.get("type") == "slots":
+            slots |= {int(x) for x in ts.get("data") or []}
+    scope = frozenset(slots) if slots else None
     if len(rules) == 1:
-        return rules[0]
-    return Rule(" OR ".join(r.description for r in rules), lambda ch: any(r(ch) for r in rules))
+        r = rules[0]
+        return Rule(r.description + (f" (slots {sorted(scope)})" if scope else ""), r.test, scope)
+    return Rule(" OR ".join(r.description for r in rules) + (f" (slots {sorted(scope)})" if scope else ""),
+                lambda ch: any(r(ch) for r in rules), scope)
 
 
 def _rules_for(gc: dict, kind: str, c: Constraints) -> list[Rule]:

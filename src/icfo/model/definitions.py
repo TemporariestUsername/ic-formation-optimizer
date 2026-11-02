@@ -100,6 +100,7 @@ class Champion:
     species: str | None = None  # race tag, e.g. "dwarf", "half-orc" (for per-unique-species effects)
     base_damage: float = 1.0
     base_attack_id: int = 0
+    attack_types: frozenset[str] = frozenset()  # base attack damage types: melee, ranged, magic
     upgrades: list[Upgrade] = field(default_factory=list)
     feats: list[Feat] = field(default_factory=list)
 
@@ -242,6 +243,9 @@ class GameData:
                 key = (hid, _int(item.get("slot_id")), _int(item.get("rarity")))
                 self.loot[key] = normalize(item.get("effects"), self.effect_defines, hero_id=hid)
         self.attacks: dict[int, dict] = {_int(a.get("id")): a for a in defs.get("attack_defines") or []}
+        for champ in self.champions.values():
+            attack = self.attacks.get(champ.base_attack_id) or {}
+            champ.attack_types = frozenset(str(t) for t in attack.get("damage_types") or [])
         self.campaigns: dict[int, dict] = {
             _int(c.get("id")): c for c in defs.get("campaign_defines") or []
         }

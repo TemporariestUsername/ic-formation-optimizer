@@ -70,6 +70,10 @@ def solve(
             if slot == k:
                 continue
             model.Add(sum(x[c.id, slot] for c in others if rule(c)) == 1)
+        for (cid, s), var in x.items():  # slot-scoped allow/ban rules
+            champ = next(c for c in others if c.id == cid)
+            if not constraints.allows_in(champ, s):
+                model.Add(var == 0)
 
         terms = []
         for c in others:
