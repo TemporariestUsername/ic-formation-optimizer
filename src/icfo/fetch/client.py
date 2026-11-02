@@ -124,6 +124,24 @@ class IdleChampionsClient:
         self.cache.save("user_details", data)
         return data
 
+    def campaign_details(self, creds: Credentials, max_age_s: float = 3600) -> dict[str, Any]:
+        """Campaign data incl. blessing definitions (reset_upgrade_defines)."""
+        cached = self.cache.load("campaign_details", max_age_s=max_age_s)
+        if cached is not None:
+            return cached
+        data = self._call(
+            {
+                "call": "getcampaigndetails",
+                "game_instance_id": 1,
+                "instance_id": 1,
+                "user_id": creds.user_id,
+                "hash": creds.hash,
+                "mobile_client_version": CLIENT_VERSION,
+            }
+        )
+        self.cache.save("campaign_details", data)
+        return data
+
     def formation_saves(self, creds: Credentials) -> dict[str, Any]:
         data = self._call(
             {

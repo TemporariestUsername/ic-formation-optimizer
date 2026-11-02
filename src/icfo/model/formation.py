@@ -100,6 +100,9 @@ class Layout:
             if kind == "col_and_back_x":
                 n = int(relation.get("num_back_cols", 1))
                 return frozenset().union(*(self.column(self.slots[src].col + i) for i in range(n + 1)))
+            if kind == "slots":  # fixed slot ids (blessings such as Hold the Line)
+                ids = relation.get("slot_ids", relation.get("data")) or []
+                return frozenset(int(i) for i in ids if 0 <= int(i) < len(self.slots))
             if kind in ("by_tags", "tags", "attack_type"):
                 return self.all  # occupant-dependent: the engine filters
             return None
@@ -110,6 +113,7 @@ class Layout:
         front_col = min(x.col for x in self.slots)
         table = {
             "self": frozenset({src}),
+            "edge": self._edge(),
             "self_slot": frozenset({src}),
             "adj": adj,
             "self_and_adj": adj | {src},
@@ -135,6 +139,19 @@ class Layout:
             "self_and_behind_and_ahead": ahead | behind | {src},
         }
         return table.get(rel)
+
+    def _edge(self) -> frozenset[int]:
+        """Slots on the outside of the formation: the top and bottom slot of each
+        column, plus the front and back columns."""
+        out: set[int] = set()
+        cols = {s.col for s in self.slots}
+        for col in cols:
+            members = [s for s in self.slots if s.col == col]
+            out.add(min(members, key=lambda s: s.y).index)
+            out.add(max(members, key=lambda s: s.y).index)
+        for col in (min(cols), max(cols)):
+            out |= self.column(col)
+        return frozenset(out)
 
     def _top_of_each_column(self) -> frozenset[int]:
         top: dict[int, Slot] = {}

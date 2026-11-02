@@ -73,6 +73,8 @@ class UserState:
     gear: dict[int, list[GearItem]] = field(default_factory=dict)
     stats: dict[str, str] = field(default_factory=dict)
     instances: list[GameInstance] = field(default_factory=list)
+    blessing_levels: dict[int, int] = field(default_factory=dict)  # reset upgrade id -> level
+    perk_levels: dict[int, int] = field(default_factory=dict)  # patron perk id -> level
     gold_growth_rate: float = 2.031
     currency_growth_rate: float = 1.25
     hero_raw: dict[int, dict] = field(default_factory=dict)
@@ -136,6 +138,9 @@ class UserState:
             gear=gear,
             stats={str(k): str(v) for k, v in (details.get("stats") or {}).items()},
             instances=instances,
+            blessing_levels={_int(k): _int(v) for k, v in (details.get("reset_upgrade_levels") or {}).items()},
+            perk_levels={_int(p.get("patron_perk_id")): _int(p.get("level"))
+                         for p in details.get("patron_perks") or [] if isinstance(p, dict)},
             gold_growth_rate=_float(adv.get("gold_growth_rate"), 2.031) or 2.031,
             currency_growth_rate=_float(adv.get("currency_growth_rate"), 1.25) or 1.25,
             hero_raw=hero_raw,

@@ -67,11 +67,14 @@ def _solve(job: _Job) -> list[dict]:
     search often finds a stronger damage formation than a short push search.)"""
     data: GameData = _STATE["data"]
     user: UserState = _STATE["user"]
-    constraints = constraints_for(data, job.adventure_id)
+    patron = _STATE.get("patron")
+    constraints = constraints_for(data, job.adventure_id, patron)
     pool = candidate_pool(list(data.champions.values()), constraints, user.owned)
     scorer = Scorer(data, constraints.layout)
     if _STATE["use_account"]:
         scorer.apply_account(user)
+    if _STATE.get("bonuses") is not None:
+        scorer.set_bonuses(_STATE["bonuses"].effects_for(job.adventure_id, patron), patron)
     scorer.stack_fraction = _STATE.get("stack_fraction", 1.0)
     scorer.stack_overrides = dict(_STATE.get("stack_overrides") or {})
     objectives = {m: make_objective(m, data, user, _STATE["calibration"], _STATE["gem_params"]) for m in job.modes}
@@ -166,6 +169,8 @@ def run_sweep(
     stack_fraction: float = 1.0,
     stack_overrides: dict[int, float] | None = None,
     tiers: Iterable[str] = TIERS,
+    bonuses=None,
+    patron: int | None = None,
     progress: Callable[[int, int], None] | None = None,
 ) -> dict:
     champs = list(data.champions.values())
@@ -173,19 +178,22 @@ def run_sweep(
     skipped = []
     for aid in sorted(adventure_ids or data.adventures):
         try:
-            c = constraints_for(data, aid)
+            c = constraints_for(data, aid, patron)
         except LayoutNotFound:
             skipped.append(aid)
             continue
         allowed = frozenset(ch.id for ch in champs if ch.id in user.owned and c.allows(ch))
-        groups.setdefault(signature(c, allowed), []).append(aid)
+        # local blessings differ per campaign, so the campaign's favor is part of the key
+        currency = bonuses.campaign_currency.get(data.adventures[aid].campaign_id) if bonuses else None
+        groups.setdefault((signature(c, allowed), currency), []).append(aid)
     group_list = list(groups.values())
     modes = tuple(modes)
     jobs = [_Job(gi, members[0], modes) for gi, members in enumerate(group_list)]
 
     _STATE.update(data=data, user=user, calibration=calibration, profile=profile,
                   use_account=use_account, gem_params=gem_params,
-                  stack_fraction=stack_fraction, stack_overrides=stack_overrides, tiers=tuple(tiers))
+                  stack_fraction=stack_fraction, stack_overrides=stack_overrides, tiers=tuple(tiers),
+                  bonuses=bonuses, patron=patron)
     started = time.time()
     results: list[dict] = []
     if workers > 1:

@@ -124,7 +124,7 @@ def calibrate(data: GameData, user: UserState, scorer_for) -> Calibration | None
         dps = [c for c in placement.values() if "dps" in c.tags] or list(placement.values())
         if not dps:
             continue
-        scorer = scorer_for(layout)
+        scorer = scorer_for(layout, inst.adventure_id)  # with that campaign's blessings
         model, carry = max(
             ((carry_base_log10(data, c) + scorer.score(placement, c.id).log10, c) for c in dps),
             key=lambda t: t[0],

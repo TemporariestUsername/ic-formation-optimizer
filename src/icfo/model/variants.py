@@ -194,11 +194,15 @@ def _probe(rules: list[Rule], champs: list[Champion], c: Constraints) -> list[Ru
     return ok
 
 
-def constraints_for(data: GameData, adventure_id: int) -> Constraints:
+def constraints_for(data: GameData, adventure_id: int, patron_id: int | None = None) -> Constraints:
+    """Formation rules for an adventure, plus the patron's restrictions when
+    playing under a patron (e.g. Mirt: only Good or Evil champions)."""
+    from .bonuses import patron_game_changes
+
     adv = data.adventures[adventure_id]
     c = Constraints(layout=data.layout_for(adventure_id))
     champs = list(data.champions.values())
-    for gc in adv.game_changes:
+    for gc in list(adv.game_changes) + patron_game_changes(data, patron_id):
         kind = gc.get("type")
         if kind == "formation" or kind in COSMETIC_OR_IRRELEVANT:
             continue

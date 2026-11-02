@@ -101,6 +101,9 @@ class Champion:
     base_damage: float = 1.0
     base_attack_id: int = 0
     attack_types: frozenset[str] = frozenset()  # base attack damage types: melee, ranged, magic
+    attack_cooldown: float = 0.0  # base attack cooldown, seconds
+    char_class: str | None = None  # character-sheet class, e.g. "fighter"
+    alignment: str | None = None  # character-sheet alignment, e.g. "neutral good"
     upgrades: list[Upgrade] = field(default_factory=list)
     feats: list[Feat] = field(default_factory=list)
 
@@ -185,6 +188,8 @@ class GameData:
                        **({"age": _int(sheet.get("age"))} if isinstance(sheet, dict) and "age" in sheet else {})},
                 species=_species(sheet.get("race") if isinstance(sheet, dict) else None, h.get("tags") or []),
                 base_damage=_float(h.get("base_damage"), 1.0),
+                char_class=(str(sheet.get("class")).lower() if isinstance(sheet, dict) and sheet.get("class") else None),
+                alignment=(str(sheet.get("alignment")).lower() if isinstance(sheet, dict) and sheet.get("alignment") else None),
                 base_attack_id=_int(h.get("base_attack_id")),
             )
         self.upgrades: dict[int, Upgrade] = {}
@@ -246,6 +251,7 @@ class GameData:
         for champ in self.champions.values():
             attack = self.attacks.get(champ.base_attack_id) or {}
             champ.attack_types = frozenset(str(t) for t in attack.get("damage_types") or [])
+            champ.attack_cooldown = _float(attack.get("cooldown"), 0.0)
         self.campaigns: dict[int, dict] = {
             _int(c.get("id")): c for c in defs.get("campaign_defines") or []
         }

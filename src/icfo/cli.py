@@ -24,6 +24,7 @@ from pathlib import Path
 from .engine.score import Scorer, static_class
 from .fetch import Cache, Credentials, IdleChampionsClient
 from .model import GameData, UserState, constraints_for
+from .model.bonuses import PATRONS, Bonuses, patron_id
 from .objectives import GemParams, ObjectiveScorer, calibrate
 from .optimize import Infeasible, anneal, candidate_pool, greedy
 from .optimize.planner import TIER_LABELS, plan_tiers
@@ -92,8 +93,10 @@ def cmd_fetch_defs(args) -> None:
 
 def cmd_fetch_user(args) -> None:
     client = IdleChampionsClient(Cache(args.cache))
-    user = UserState.from_details(client.user_details(Credentials.from_env(), max_age_s=0))
-    print(f"user data cached: {len(user.owned)} champions owned")
+    creds = Credentials.from_env()
+    user = UserState.from_details(client.user_details(creds, max_age_s=0))
+    client.campaign_details(creds, max_age_s=0)
+    print(f"user data cached: {len(user.owned)} champions owned; campaign details (blessings) cached")
 
 
 def cmd_adventures(args) -> None:
@@ -128,17 +131,34 @@ def cmd_layout(args) -> None:
         print("warning:", w)
 
 
+def _bonuses(args, data: GameData, user: UserState) -> Bonuses | None:
+    if not user.from_account or getattr(args, "no_bonuses", False):
+        return None
+    details = Cache(args.cache).load("campaign_details")
+    if details is None:
+        print("note: no campaign details cached (run fetch-user); blessings not applied", file=sys.stderr)
+    b = Bonuses(data, user, details)
+    return b if b.available else None
+
+
 def _scorer_factory(data: GameData, user: UserState, args):
     stacks = _load_stacks(args.stacks, data) if getattr(args, "stacks", None) else {}
+    bonuses = _bonuses(args, data, user)
+    patron = patron_id(getattr(args, "patron", None))
 
-    def make(layout):
+    def make(layout, adventure_id: int | None = None, patron_override: int | None = None):
         scorer = Scorer(data, layout)
         if user.from_account:
             scorer.apply_account(user)
         scorer.stack_overrides = dict(stacks)
         scorer.stack_fraction = args.stack_assumption
+        if bonuses is not None:
+            p = patron if patron_override is None else patron_override
+            scorer.set_bonuses(bonuses.effects_for(adventure_id, p), p)
         return scorer
 
+    make.bonuses = bonuses
+    make.patron = patron
     return make
 
 
@@ -176,7 +196,8 @@ def cmd_calibrate(args) -> None:
 def cmd_optimize(args) -> None:
     data = _load_defs(args)
     user = _load_user(args, data)
-    constraints = constraints_for(data, args.adventure)
+    make = _scorer_factory(data, user, args)
+    constraints = constraints_for(data, args.adventure, make.patron)
     carry = None
     if args.carry and args.carry != "auto":
         carry = data.champion(args.carry)
@@ -185,10 +206,9 @@ def cmd_optimize(args) -> None:
         if not constraints.allows(carry):
             sys.exit(f"{carry.name} is not allowed in this adventure.")
     pool = candidate_pool(list(data.champions.values()), constraints, user.owned)
-    make = _scorer_factory(data, user, args)
     cal = _calibration(args, data, user, make)
     objective = make_objective(args.mode, data, user, cal, _gem_params(args, user, args.adventure))
-    oscorer = ObjectiveScorer(make(constraints.layout), objective)
+    oscorer = ObjectiveScorer(make(constraints.layout, args.adventure), objective)
 
     try:
         if args.solver == "planner":
@@ -225,7 +245,13 @@ def cmd_optimize(args) -> None:
         print(f"== {TIER_LABELS[tier_names[0]]} ==")
     print(f"{adv.name} (id {adv.id}) - mode: {args.mode}, carry: {carry.name}"
           + (f"  (auto, compared: {', '.join(tried)})" if len(tried) > 1 else ""))
-    print(f"account: {'yours (specs, feats, gear applied)' if user.from_account else 'theory (owns everything, default specs)'}\n")
+    print(f"account: {'yours (specs, feats, gear applied)' if user.from_account else 'theory (owns everything, default specs)'}")
+    if make.bonuses is not None:
+        applied = make.bonuses.for_adventure(args.adventure, make.patron)
+        kinds = Counter(b.kind for b in applied)
+        print("bonuses: " + ", ".join(f"{n} {k}s" for k, n in sorted(kinds.items()))
+              + (f" (patron: {PATRONS[make.patron]})" if make.patron else " (no patron)"))
+    print()
     print(constraints.layout.render(labels, width=12))
     if spec_changes:
         print("\nspecialization changes for this formation:")
@@ -262,6 +288,9 @@ def cmd_optimize(args) -> None:
         print("speed effects used:")
         for e in sc.speed:
             print(f"  {e.source:<20} {e.key} {'' if e.amount is None else f'{e.amount:g}'}")
+    if sc.bonus_unmodelled:
+        print("\nblessings/perks not scored (monster- or area-specific, or not damage):")
+        print("  " + ", ".join(sorted(sc.bonus_unmodelled)))
     if sc.unmodelled_by_hero:
         print("\nunmodelled effects (result may under/over-rate these champions):")
         for name, keys in sorted(sc.unmodelled_by_hero.items()):
@@ -320,6 +349,7 @@ def cmd_sweep(args) -> None:
         stack_fraction=args.stack_assumption,
         stack_overrides=_load_stacks(args.stacks, data) if args.stacks else None,
         tiers=[t.strip() for t in args.tiers.split(",") if t.strip()],
+        bonuses=make.bonuses, patron=make.patron,
     )
     print(json.dumps(summary, indent=2))
     print(f"wrote {args.out}" + (f" and {args.json}" if args.json else ""))
@@ -382,6 +412,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="theory-craft: own every champion, default specs, no gear")
         sp.add_argument("--stacks", help='JSON stack assumptions, e.g. {"Walnut:Pen-Paws": 20, "11654": 60}')
         sp.add_argument("--no-calibration", action="store_true", help="don't anchor damage to your progress")
+        sp.add_argument("--no-bonuses", action="store_true", help="ignore blessings and patron perks")
+        sp.add_argument("--patron", help="play under a patron: Mirt, Vajra, Strahd, Zariel, Elminster")
         sp.add_argument("--stack-assumption", type=float, default=1.0,
                         help="share of max stacks assumed for kill/attack/timer stacks (1 = full, 0 = ignore)")
 

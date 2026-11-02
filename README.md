@@ -44,8 +44,20 @@ worth about 3.25 areas. Monster gold is a fixed share of health. Favor grows ×1
 favor ∝ gold^0.315. Since the area you stall at is where damage meets health,
 log10(favor) ≈ 0.315·(log10 damage + log10 gold find) + const.
 
-**Calibration.** The model leaves out champion levels, legendaries, blessings, patron
-perks and potions. Those mostly don't depend on the formation, so they don't change
+**Blessings and patron perks.** Blessing definitions come from `getcampaigndetails`
+(fetched by `fetch-user`), and your levels come from your account. Type 1 blessings are
+**local** (only in that campaign's adventures) and type 2 are **global** (everywhere).
+Patron perks work the same way: type 1 only while playing under that patron (`--patron
+Mirt|Vajra|Strahd|Zariel|Elminster`, which also applies the patron's restrictions), and
+type 2 always. Amount = per-level × level. Several change which formation is best:
+fixed-slot damage (Hold the Line), tag-filtered damage (Common Races, Hearts of
+Neutrality), per-unique species/class/alignment multipliers, cooldown-conditional damage
+(Heavy Hitters), and attack-speed blessings (cooldown reductions reaching the carry are
+summed, and DPS scales with 1/cooldown, floored at 25% of base). Monster-health
+reductions count as equivalent damage. Blessings that depend on monster types, area tags
+or other systems are listed as "not scored". `--no-bonuses` turns all of this off.
+
+**Calibration.** The model leaves out champion levels, legendaries and potions. Those mostly don't depend on the formation, so they don't change
 rankings, but they do affect absolute areas. `icfo calibrate` anchors model damage to
 your furthest instance (its formation and highest area) to estimate reachable areas.
 That instance may not be at its wall, so the estimates are lower bounds.
@@ -210,10 +222,9 @@ contains personal data (email, linked accounts). Only the fields listed in
    (`expression_on_trigger`, `broadcast_on_trigger`, `*_stacks` keys, Aerois Synergy,
    Mithral Hall), starting with the supports that show up most in optimized formations.
    Also: effects conditional on specific feats, and `affected_by_upgrade` filters.
-2. **Account fidelity.** Specs, feats and gear are applied, and the planner picks
-   specializations and feats per formation, objective and tier. Still missing:
-   blessings (local/global, via `getcampaigndetails`), patron perks, legendaries and
-   familiars.
+2. **Account fidelity.** Specs, feats, gear, blessings and patron perks are applied,
+   and the planner picks specializations and feats per formation, objective and tier.
+   Still missing: legendaries, familiars, and area-tag/monster-type blessings.
 3. **Better carry comparison.** Add levels and ultimates to the base-attack model.
 4. **Pairwise CP-SAT terms.** Add product variables for interactions the surrogate
    misses, such as an amplifier boosting a positional buff.

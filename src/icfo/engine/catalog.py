@@ -26,6 +26,16 @@ DAMAGE_KEYS = frozenset({
     "hero_dps_mult_per_tagged_crusader_mult",
     "hero_dps_mult_per_target_crusader",
     "hero_dps_mult_per_target_tag_crusader_mult_amount_before",
+    # mostly from blessings / patron perks, but generic
+    "global_dps_multiplier_times_desc",
+    "hero_dps_multiplier_if_attack_cooldown",
+    "global_dps_mult_per_tagged_crusader_mult",
+    "global_dps_mult_per_unique_race_character_mult",
+    "global_dps_mult_per_unique_class_mult",
+    "global_dps_mult_per_unique_alignment_mult",
+    "global_dps_mult_per_loot_rarity_mult",
+    "monster_health_reduce",
+    "monster_health_decrease",
 })
 
 AMPLIFIER_KEYS = frozenset({
@@ -112,6 +122,7 @@ COUNTED_STACK_FUNCS = frozenset({
     "adjacent_champions",
     "per_unique_race",
     "per_upgrade_targets",
+    "check_patron",
 })
 
 # how a stack count combines with the amount

@@ -51,6 +51,9 @@ from .catalog import (
 )
 
 AMPLIFIER_PASSES = 4
+# floor for the carry's base attack cooldown after reductions (assumption: the game's
+# real minimum isn't in the definitions)
+MIN_COOLDOWN_SHARE = 0.25
 # Runtime stacks are assumed to be maxed only for generic triggers with a
 # reachable cap; bigger caps (10k .. 4e9 exist) are never reached in practice.
 MAX_ASSUMED_STACKS = 500
@@ -88,6 +91,7 @@ class ScoreResult:
     modelled_approx: int = 0
     gold_log10: float = 0.0
     speed: list[SpeedEffect] = field(default_factory=list)
+    bonus_unmodelled: Counter = field(default_factory=Counter)  # blessings/perks we can't score
     damage_log10: float | None = None  # set when log10 is replaced by an objective value
 
     @property
@@ -140,6 +144,16 @@ _FORMATION_STACK_FUNCS = frozenset({
 
 # amplifiers whose stack count can't depend on the formation when they have no
 # stack_func/trigger: compiled once per champion
+_GLOBAL_KEYS = frozenset({
+    "global_dps_multiplier_mult", "global_dps_multiplier_times_desc",
+    "global_dps_mult_per_tagged_crusader_mult", "global_dps_mult_per_unique_race_character_mult",
+    "global_dps_mult_per_unique_class_mult", "global_dps_mult_per_unique_alignment_mult",
+    "global_dps_mult_per_loot_rarity_mult", "monster_health_reduce", "monster_health_decrease",
+})
+
+# stand-in source for account-wide bonuses (blessings, patron perks)
+BONUS_SOURCE = Champion(id=-1, name="Blessings & perks", seat=-1, tags=frozenset())
+
 _STATIC_AMP_KEYS = frozenset({
     "buff_upgrade", "buff_upgrades", "buff_upgrade_multiplicative",
     "buff_upgrades_multiplicative", "buff_upgrade_add_then_mult", "buff_upgrade_add_flat_amount",
@@ -184,9 +198,17 @@ class Scorer:
         self.gear: dict[int, list[GearItem]] = {}
         # share of max_stacks assumed for runtime-stacked effects (1.0 = fully stacked)
         self.stack_fraction: float = 1.0
+        # account-wide bonuses (blessings, patron perks) for the current adventure
+        self.patron_id: int | None = None
+        self._bonus_compiled: _Compiled | None = None
         self._uid_cache: dict[int, frozenset[int]] = {}
         self._compiled_cache: dict[int, _Compiled] = {}
         self._patched_cache: dict[tuple, tuple[list[Effect], _Compiled]] = {}
+
+    def set_bonuses(self, effects: list[Effect], patron_id: int | None = None) -> None:
+        """Blessings and patron perks in force for the adventure being optimised."""
+        self.patron_id = patron_id
+        self._bonus_compiled = self._compile(list(effects)) if effects else None
 
     def effects_for(self, champ: Champion) -> list[Effect]:
         if champ.id not in self._effects:
@@ -252,11 +274,14 @@ class Scorer:
         )
         result = ScoreResult(log10=0.0)
         compiled = self._apply_modifiers(ctx, result)
-        factor, flat, approx_keys = self._amplifiers(ctx, compiled, result)
+        sources = [(slot, ctx.placement[slot], comp) for slot, comp in compiled.items()]
+        if self._bonus_compiled is not None:
+            sources.append((carry_slot, BONUS_SOURCE, self._bonus_compiled))
+        factor, flat, approx_keys = self._amplifiers(ctx, sources, result)
+        cooldown_cut = 0.0
 
-        for src_slot, src in placement.items():
-            comp = compiled[src_slot]
-            if src_slot == carry_slot:
+        for src_slot, src, comp in sources:
+            if src.id == ctx.carry.id:
                 todo = comp.others + comp.self_only
             else:
                 todo = comp.others
@@ -273,6 +298,19 @@ class Scorer:
                         continue
                     if e.key in SPEED_KEYS:
                         result.speed.append(self._speed(e, src, src_slot, ctx, factor, flat))
+                        result.modelled_exact += 1
+                        continue
+                    if e.key == "reduce_attack_cooldown" and e.stack_func is None and not e.triggered:
+                        # summed over all sources, applied once below (DPS ∝ 1/cooldown)
+                        if self._targets_carry(e, src, src_slot, ctx):
+                            cooldown_cut += self._scaled_amount(e, factor, flat)
+                        result.modelled_exact += 1
+                        continue
+                    if e.key == "full_equip_dps_mult":
+                        if len(self.gear.get(ctx.carry.id, ())) >= 6 and self._targets_carry(e, src, src_slot, ctx):
+                            v = self._amplified(e, "add", 1.0, factor, flat)
+                            result.log10 += v
+                            result.contributions.append(Contribution(src.name, e.key, e.upgrade_id, v, True))
                         result.modelled_exact += 1
                         continue
                     if e.key in INTRINSIC_KEYS:
@@ -295,10 +333,19 @@ class Scorer:
                 if value:
                     result.log10 += value
                     result.contributions.append(Contribution(src.name, e.key, e.upgrade_id, value, exact))
+        if cooldown_cut > 0 and ctx.carry.attack_cooldown > 0:
+            cd = ctx.carry.attack_cooldown
+            new_cd = max(cd - cooldown_cut, cd * MIN_COOLDOWN_SHARE)
+            v = math.log10(cd / new_cd)
+            result.log10 += v
+            result.contributions.append(Contribution("attack cooldown", "reduce_attack_cooldown", None, v, True))
         return result
 
     @staticmethod
     def _note_unmodelled(result: ScoreResult, src: Champion, e: Effect) -> None:
+        if src is BONUS_SOURCE:
+            result.bonus_unmodelled[e.raw.get("_bonus", e.key)] += 1
+            return
         result.unmodelled[e.key] += 1
         result.unmodelled_by_hero.setdefault(src.name, Counter())[e.key] += 1
 
@@ -391,7 +438,7 @@ class Scorer:
         return compiled
 
     # -- 2. amplifiers ---------------------------------------------------
-    def _amplifiers(self, ctx: _Ctx, compiled: dict[int, "_Compiled"], result: ScoreResult):
+    def _amplifiers(self, ctx: _Ctx, sources: list, result: ScoreResult):
         """Return (factor, flat, approx_keys), keyed by (upgrade_id, index or None).
 
         Stack counts are computed once; the fixed-point passes (amplifiers of
@@ -410,8 +457,7 @@ class Scorer:
                 if not exact:
                     approx_keys.update(keys)
 
-        for slot, comp in compiled.items():
-            src = ctx.placement[slot]
+        for slot, src, comp in sources:
             for e in comp.bad_amps:
                 self._note_unmodelled(result, src, e)
             result.modelled_exact += len(comp.static_amps)
@@ -563,18 +609,50 @@ class Scorer:
     # -- 3. damage -------------------------------------------------------
     def _damage(self, e: Effect, src: Champion, src_slot: int, ctx: _Ctx, factor, flat) -> tuple[float, bool]:
         key = e.key
-        if key == "global_dps_multiplier_mult":
+        if key in _GLOBAL_KEYS:
             if not self._passes_filters(e, ctx.carry):  # targets don't restrict "global"
                 return 0.0, True
         elif not self._targets_carry(e, src, src_slot, ctx):
             return 0.0, True
 
-        if key in ("hero_dps_multiplier_mult", "global_dps_multiplier_mult"):
+        if key in ("monster_health_reduce", "monster_health_decrease"):
+            # weaker monsters = damage-equivalent: 1 / (1 - x%)
+            pct = min(self._scaled_amount(e, factor, flat), 99.9)
+            return -math.log10(1 - pct / 100.0), True
+        if key == "hero_dps_multiplier_if_attack_cooldown":
+            op = _OPS.get(e.args[1] if len(e.args) > 1 else "")
+            if op is None or not op(float(ctx.carry.attack_cooldown), e.num(2)):
+                return 0.0, True
+            return self._amplified(e, "add", 1.0, factor, flat), True
+        if key.startswith("global_dps_mult_per_"):
+            return self._amplified(e, "mult", self._global_count(e, src, ctx), factor, flat), True
+        if key in ("hero_dps_multiplier_mult", "global_dps_multiplier_mult", "global_dps_multiplier_times_desc"):
             n, exact = self._stacks(e, src, src_slot, ctx)
             mode = self._mode(e)
         else:
             n, exact, mode = self._key_count(e, src, src_slot, ctx), True, ("mult" if e.stacks_multiply else "add")
         return self._amplified(e, mode, n, factor, flat), exact
+
+    def _global_count(self, e: Effect, src: Champion, ctx: _Ctx) -> float:
+        key, present = e.key, ctx.present
+        if key == "global_dps_mult_per_tagged_crusader_mult":
+            expr = e.args[1] if len(e.args) > 1 else ""
+            return self._count(ctx, src, lambda c: match_tags(expr, c.tags), e.exclude_self)
+        if key == "global_dps_mult_per_unique_race_character_mult":
+            return len({c.species for c in present if c.species})
+        if key == "global_dps_mult_per_unique_class_mult":
+            return len({c.char_class for c in present if c.char_class})
+        if key == "global_dps_mult_per_unique_alignment_mult":
+            return len({c.alignment for c in present if c.alignment})
+        if key == "global_dps_mult_per_loot_rarity_mult":
+            op, rarity = _OPS.get(e.args[1] if len(e.args) > 1 else ">="), e.num(2, 4)
+            if op is None:
+                raise _Unmodelled
+            return sum(
+                1 for c in present
+                if self.gear.get(c.id) and all(op(float(g.rarity), rarity) for g in self.gear[c.id])
+            )
+        raise _Unmodelled
 
     def _amplified(self, e: Effect, mode: str, n: float, factor, flat) -> float:
         """log10 multiplier of a stacked effect with buffs applied pre- or post-stack."""
@@ -682,6 +760,8 @@ class Scorer:
                 v = evaluate(expr, c, e.raw)
                 total += float(v) if not isinstance(v, bool) else (1.0 if v else 0.0)
             return total, exact
+        if sf == "check_patron":
+            return (1.0 if self.patron_id else 0.0), True
         if sf in ("per_crusader", "per_hero", "per_tagged_crusader_mult"):
             tag = e.raw.get("tag")
             return float(self._count(ctx, src, lambda c: not tag or match_tags(str(tag), c.tags), e.exclude_self)), exact
